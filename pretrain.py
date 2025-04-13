@@ -513,7 +513,7 @@ def train(args, rank, world_size):
                 wandb.log(metrics)
                 
                 # Also log to console for visibility
-                if rank == 0 and global_step % (args.logging_steps * 5) == 0:
+                if rank == 0 and global_step % (args.logging_steps * 1) == 0:
                     logger.info(f"Step {global_step}: loss={loss_value:.4f}, lr={current_lr:.6f}, moe_loss={moe_loss:.6f}")
                 
                 # Reset timer for samples per second calculation
