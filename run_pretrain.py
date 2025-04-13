@@ -19,8 +19,8 @@ if __name__ == "__main__":
     # Advanced training options
     parser.add_argument("--gradient_accumulation_steps", type=int, default=1, 
                         help="Number of updates steps to accumulate before performing a backward/update pass")
-    parser.add_argument("--precision", type=str, choices=["fp32", "fp16", "bf16", "tf32"], default="fp32",
-                        help="Precision for training (fp32, fp16, bf16, tf32)")
+    parser.add_argument("--precision", type=str, choices=["fp32", "fp16", "bf16"], default="fp32",
+                        help="Precision for training (fp32, fp16, bf16)")
     parser.add_argument("--gradient_checkpointing", action="store_true", 
                         help="Enable gradient checkpointing to save memory at the expense of speed")
     parser.add_argument("--deepspeed", action="store_true", 

@@ -4,6 +4,7 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 import torch.distributed as dist
+import torch.multiprocessing as mp
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader, Dataset
 from torch.utils.data.distributed import DistributedSampler
@@ -18,6 +19,9 @@ import numpy as np
 import json
 from quasar import QuasarConfig, create_quasar_model
 import torch.cuda.amp as amp
+
+# Set multiprocessing start method to 'spawn' for CUDA compatibility
+mp.set_start_method('spawn', force=True)
 
 # Import DeepSpeed if available
 try:
@@ -43,7 +47,7 @@ class C4Dataset(Dataset):
         # Load C4 dataset from Hugging Face
         logger.info(f"Loading C4 dataset ({split} split)...")
         try:
-            self.dataset = load_dataset("c4", "en", split=split, cache_dir=cache_dir)
+            self.dataset = load_dataset("eyad-silx/wiki-pretrain", "ab", split=split, cache_dir=cache_dir)
             logger.info(f"Loaded {len(self.dataset)} examples")
         except Exception as e:
             logger.warning(f"Failed to load C4 dataset: {e}")
@@ -143,18 +147,19 @@ def train(args, rank, world_size):
     tokenizer.unk_token = "<｜▁unk▁｜>"
     
     # Create datasets and dataloaders
+    device = torch.device("cuda", rank) if torch.cuda.is_available() else torch.device("cpu")
     train_dataset = C4Dataset(
         tokenizer=tokenizer,
         split="train",
         max_length=args.max_seq_length,
-        cache_dir=args.cache_dir
+        cache_dir=args.cache_dir,
     )
     
     val_dataset = C4Dataset(
         tokenizer=tokenizer,
         split="validation",
         max_length=args.max_seq_length,
-        cache_dir=args.cache_dir
+        cache_dir=args.cache_dir,
     )
     
     if args.distributed and not args.deepspeed:
@@ -169,7 +174,8 @@ def train(args, rank, world_size):
         batch_size=args.batch_size,
         sampler=train_sampler,
         num_workers=args.num_workers,
-        pin_memory=True
+        pin_memory=True,
+        persistent_workers=True if args.num_workers > 0 else False
     )
     
     val_loader = DataLoader(
@@ -177,7 +183,8 @@ def train(args, rank, world_size):
         batch_size=args.batch_size,
         sampler=val_sampler,
         num_workers=args.num_workers,
-        pin_memory=True
+        pin_memory=True,
+        persistent_workers=True if args.num_workers > 0 else False
     )
     
     # Create model
@@ -219,17 +226,17 @@ def train(args, rank, world_size):
         else:
             logger.warning(f"DeepSpeed config file {args.deepspeed_config} not found. Using default config.")
             ds_config = {
-                "train_batch_size": args.batch_size * world_size * args.gradient_accumulation_steps,
-                "gradient_accumulation_steps": args.gradient_accumulation_steps,
+                "train_batch_size": int(args.batch_size * world_size * args.gradient_accumulation_steps),
+                "gradient_accumulation_steps": int(args.gradient_accumulation_steps),
                 "optimizer": {
                     "type": args.optimizer.capitalize(),
                     "params": optimizer_params
                 },
                 "fp16": {
-                    "enabled": args.precision == "fp16"
+                    "enabled": args.precision == "fp16" and args.precision != "bf16"
                 },
                 "bf16": {
-                    "enabled": args.precision == "bf16"
+                    "enabled": args.precision == "bf16" and args.precision != "fp16"
                 },
                 "scheduler": {
                     "type": "WarmupDecayLR",
@@ -258,6 +265,10 @@ def train(args, rank, world_size):
                 "wall_clock_breakdown": False
             }
         
+        # Move model to GPU before DeepSpeed initialization
+        device = torch.device("cuda", rank) if torch.cuda.is_available() else torch.device("cpu")
+        model = model.to(device)
+        
         # Initialize DeepSpeed
         model, optimizer, _, scheduler = deepspeed.initialize(
             model=model,
@@ -268,7 +279,7 @@ def train(args, rank, world_size):
     else:
         # Standard training setup (non-DeepSpeed)
         # Move model to GPU and setup DDP if needed
-        model = model.to(rank)
+        model = model.to(device)
         if args.distributed:
             model = DDP(model, device_ids=[rank])
         
@@ -330,7 +341,10 @@ def train(args, rank, world_size):
     
     # Training loop
     logger.info("Starting training...")
-    scaler = amp.GradScaler(enabled=args.precision in ["fp16", "bf16"] and not args.deepspeed)
+    if args.precision in ["fp16", "bf16"] and not args.deepspeed:
+        scaler = torch.amp.GradScaler("cuda", enabled=True)
+    else:
+        scaler = torch.amp.GradScaler("cuda", enabled=False)
     
     for epoch in range(start_epoch, args.num_epochs):
         model.train()
@@ -348,10 +362,16 @@ def train(args, rank, world_size):
         for step, batch in enumerate(progress_bar):
             # Move batch to device (not needed for DeepSpeed)
             if not args.deepspeed:
-                batch = {k: v.to(rank) for k, v in batch.items()}
+                batch = {k: v.to(device) for k, v in batch.items()}
             
             # DeepSpeed handles mixed precision internally
             if args.deepspeed:
+                # Ensure all tensors are on the correct device
+                cuda_device = torch.device("cuda", rank if torch.cuda.is_available() else "cpu")
+                for k, v in batch.items():
+                    if isinstance(v, torch.Tensor):
+                        batch[k] = v.to(cuda_device)
+                
                 # Forward pass with DeepSpeed
                 outputs = model(**batch)
                 loss = outputs["loss"]
@@ -435,7 +455,7 @@ def train(args, rank, world_size):
         logger.info(f"Epoch {epoch+1}/{args.num_epochs} - Average Loss: {epoch_loss:.4f}")
         
         # Validation
-        val_loss = evaluate(model, val_loader, rank, is_deepspeed=args.deepspeed)
+        val_loss = evaluate(model, val_loader, device, is_deepspeed=args.deepspeed)
         logger.info(f"Epoch {epoch+1}/{args.num_epochs} - Validation Loss: {val_loss:.4f}")
         
         # Log validation metrics
@@ -474,6 +494,11 @@ def evaluate(model, dataloader, device, is_deepspeed=False):
             # Move batch to device (not needed for DeepSpeed)
             if not is_deepspeed:
                 batch = {k: v.to(device) for k, v in batch.items()}
+            else:
+                # Ensure all tensors are on the correct device for DeepSpeed
+                for k, v in batch.items():
+                    if isinstance(v, torch.Tensor):
+                        batch[k] = v.to(device)
             
             # Forward pass
             if is_deepspeed:
@@ -572,13 +597,18 @@ def main():
     # Create output directory
     os.makedirs(args.output_dir, exist_ok=True)
     
+    # Set a smaller number of workers if using DeepSpeed to avoid CUDA issues
+    if args.deepspeed and args.num_workers > 0:
+        args.num_workers = min(2, args.num_workers)
+        logger.info(f"Using {args.num_workers} dataloader workers with DeepSpeed")
+    
     # Launch training
     if args.deepspeed and DEEPSPEED_AVAILABLE:
         # DeepSpeed handles distributed training internally
         logger.info("Using DeepSpeed for distributed training")
         train(args, 0, args.world_size)
     elif args.distributed:
-        import torch.multiprocessing as mp
+        logger.info(f"Using distributed training with {args.world_size} GPUs")
         mp.spawn(train, args=(args, args.world_size), nprocs=args.world_size, join=True)
     else:
         train(args, 0, 1)

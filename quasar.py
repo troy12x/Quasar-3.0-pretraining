@@ -31,10 +31,69 @@ def rotate_half(x: torch.Tensor) -> torch.Tensor:
     return torch.cat([-x2, x1], dim=-1)
 
 def apply_rotary_pos_emb(q: torch.Tensor, k: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-    # q, k: [batch, seq, heads, head_dim]
-    # cos, sin: [seq_len, head_dim]
+    """Apply rotary position embeddings to queries and keys.
+    
+    This implementation is designed to be robust to dimension mismatches, which can occur
+    when using different model configurations or when integrating with DeepSpeed.
+    
+    Args:
+        q: Query tensor of shape [batch, seq, heads, head_dim]
+        k: Key tensor of shape [batch, seq, heads, head_dim]
+        cos: Cosine tensor from precomputed_freqs_cis
+        sin: Sine tensor from precomputed_freqs_cis
+        
+    Returns:
+        Tuple of rotary position embedded query and key tensors
+    """
+    # Get dimensions
+    batch_size, seq_len, num_heads, head_dim = q.shape
+    
+    # First, ensure cos and sin have the right dimensions
+    # They should be [seq_len, head_dim] or [batch, seq_len, head_dim]
+    if cos.dim() > 2:
+        # If cos has more than 2 dimensions, extract the last 2 dimensions
+        cos = cos.view(-1, *cos.shape[-2:])[-seq_len:]
+        sin = sin.view(-1, *sin.shape[-2:])[-seq_len:]
+    
+    # Ensure cos and sin have the right sequence length
+    if cos.size(0) > seq_len:
+        cos = cos[:seq_len]
+        sin = sin[:seq_len]
+    elif cos.size(0) < seq_len:
+        # Pad if needed (should be rare)
+        pad_len = seq_len - cos.size(0)
+        # Create padding with the right dimensions
+        cos_padding = cos[-1:].expand(pad_len, cos.size(1))
+        sin_padding = sin[-1:].expand(pad_len, sin.size(1))
+        cos = torch.cat([cos, cos_padding], dim=0)
+        sin = torch.cat([sin, sin_padding], dim=0)
+    
+    # Ensure cos and sin have the right feature dimension
+    if cos.size(1) > head_dim:
+        cos = cos[:, :head_dim]
+        sin = sin[:, :head_dim]
+    elif cos.size(1) < head_dim:
+        # Pad with zeros
+        pad_dim = head_dim - cos.size(1)
+        cos = F.pad(cos, (0, pad_dim))
+        sin = F.pad(sin, (0, pad_dim))
+    
+    # Reshape for broadcasting: [seq_len, head_dim] -> [1, seq_len, 1, head_dim]
+    cos = cos.view(1, seq_len, 1, head_dim)
+    sin = sin.view(1, seq_len, 1, head_dim)
+    
+    # Repeat for all heads if needed
+    cos = cos.expand(1, 1, num_heads, 1)
+    sin = sin.expand(1, 1, num_heads, 1)
+    
+    # Repeat for batch dimension
+    cos = cos.expand(batch_size, 1, 1, 1)
+    sin = sin.expand(batch_size, 1, 1, 1)
+    
+    # Apply rotary embeddings
     q_embed = (q * cos) + (rotate_half(q) * sin)
     k_embed = (k * cos) + (rotate_half(k) * sin)
+    
     return q_embed, k_embed
 
 def precompute_freqs_cis(dim: int, end: int, theta: float = 10000.0) -> tuple[torch.Tensor, torch.Tensor]:
@@ -60,20 +119,32 @@ class MultiHeadLatentAttention(nn.Module):
         self.W_DKV = nn.Linear(self.hidden_size, self.kv_compressed_dim)
         self.W_UK = nn.Linear(self.kv_compressed_dim, self.num_heads * self.head_dim)
         self.W_UV = nn.Linear(self.kv_compressed_dim, self.num_heads * self.head_dim)
-        self.W_KR = nn.Linear(self.head_dim, self.rope_dim_per_head)
         
-        self.W_DQ = nn.Linear(self.hidden_size, self.query_compressed_dim)
-        self.W_UQ = nn.Linear(self.query_compressed_dim, self.num_heads * self.head_dim)
-        self.W_QR = nn.Linear(self.head_dim, self.rope_dim_per_head)
+        # Query projection
+        if self.query_compressed_dim is not None:
+            self.W_DQ = nn.Linear(self.hidden_size, self.query_compressed_dim)
+            self.W_UQ = nn.Linear(self.query_compressed_dim, self.num_heads * self.head_dim)
+        else:
+            self.W_Q = nn.Linear(self.hidden_size, self.num_heads * self.head_dim)
         
+        # Rotary projections if using partial rotary
+        if self.rope_dim_per_head > 0 and self.rope_dim_per_head < self.head_dim:
+            self.W_QR = nn.Linear(self.head_dim, self.rope_dim_per_head, bias=False)
+            self.W_KR = nn.Linear(self.head_dim, self.rope_dim_per_head, bias=False)
+        else:
+            self.W_QR = None
+            self.W_KR = None
+        
+        # Output projection
         self.W_O = nn.Linear(self.num_heads * self.head_dim, self.hidden_size)
         
-        # Attention dropout for regularization
+        # Dropout
         self.attention_dropout = getattr(config, 'attention_dropout_prob', 0.0)
         
         # Precompute freqs for RoPE
         self.register_buffer("cos", None, persistent=False)
         self.register_buffer("sin", None, persistent=False)
+        self.max_seq_length = 0
         
         # TTM flag - only used for loss modulation, not to replace MLA
         self.use_ttm = getattr(config, 'use_ttm', False)
@@ -81,103 +152,148 @@ class MultiHeadLatentAttention(nn.Module):
     def forward(self, hidden_states, attention_mask=None, past_key_value=None, position_ids=None, token_temperatures=None):
         batch_size, seq_length = hidden_states.shape[:2]
         
-        # Initialize or extend position_ids
+        # Initialize position_ids if not provided
         if position_ids is None:
-            if past_key_value is None:
-                position_ids = torch.arange(seq_length, device=hidden_states.device)
-            else:
-                position_ids = torch.arange(past_key_value[0].size(1), past_key_value[0].size(1) + seq_length, device=hidden_states.device)
+            position_ids = torch.arange(seq_length, dtype=torch.long, device=hidden_states.device).unsqueeze(0)
+            position_ids = position_ids.expand(batch_size, -1)
         
-        # Initialize RoPE freq cache if needed
-        if self.cos is None or self.cos.size(0) < position_ids.max() + 1:
-            max_seq_len = max(position_ids.max() + 1, self.config.max_position_embeddings)
-            self.cos, self.sin = precompute_freqs_cis(self.rope_dim_per_head, max_seq_len)
-            self.cos = self.cos.to(hidden_states.device)
-            self.sin = self.sin.to(hidden_states.device)
-        
-        # Compress and project KV
-        c_kv = self.W_DKV(hidden_states)  # [batch, seq, dc]
-        k = self.W_UK(c_kv).view(batch_size, seq_length, self.num_heads, self.head_dim)
-        v = self.W_UV(c_kv).view(batch_size, seq_length, self.num_heads, self.head_dim)
-        
-        # Compress and project Q
-        c_q = self.W_DQ(hidden_states)  # [batch, seq, d'c]
-        q = self.W_UQ(c_q).view(batch_size, seq_length, self.num_heads, self.head_dim)
-        
-        # Apply RoPE to decoupled components
-        k_r = self.W_KR(k.reshape(-1, self.head_dim)).reshape(batch_size, seq_length, self.num_heads, self.rope_dim_per_head)
-        q_r = self.W_QR(q.reshape(-1, self.head_dim)).reshape(batch_size, seq_length, self.num_heads, self.rope_dim_per_head)
-        
-        # Get cos/sin for current positions
-        cos = self.cos[position_ids]  # [seq, rope_dim]
-        sin = self.sin[position_ids]  # [seq, rope_dim]
-        
-        # Apply RoPE to decoupled components
-        q_r, k_r = apply_rotary_pos_emb(
-            q_r.transpose(1, 2),  # [batch, heads, seq, dRh]
-            k_r.transpose(1, 2),  # [batch, heads, seq, dRh]
-            cos.unsqueeze(0).unsqueeze(0),  # [1, 1, seq, dRh]
-            sin.unsqueeze(0).unsqueeze(0),  # [1, 1, seq, dRh]
-        )
-        
-        # Reshape back
-        q_r = q_r.transpose(1, 2)  # [batch, seq, heads, dRh]
-        k_r = k_r.transpose(1, 2)  # [batch, seq, heads, dRh]
-        
-        # Cache latent KV and decoupled RoPE key for generation
+        # Initialize or extend position_ids based on past_key_value
+        past_length = 0
         if past_key_value is not None:
-            c_kv = torch.cat([past_key_value[0], c_kv], dim=1)
-            k_r = torch.cat([past_key_value[1], k_r], dim=1)
-            # Recompute k and v with the full c_kv
-            k_full = self.W_UK(c_kv).view(batch_size, -1, self.num_heads, self.head_dim)
-            v_full = self.W_UV(c_kv).view(batch_size, -1, self.num_heads, self.head_dim)
-            k, v = k_full, v_full
+            # past_key_value[0] shape: [batch_size, num_heads, seq_length, head_dim] or [batch_size, seq_length, num_heads, head_dim]
+            if past_key_value[0].dim() >= 3:
+                if past_key_value[0].dim() == 4 and past_key_value[0].shape[1] == self.num_heads:
+                    # [batch_size, num_heads, seq_length, head_dim] format
+                    past_length = past_key_value[0].shape[2]
+                else:
+                    # [batch_size, seq_length, ...] format
+                    past_length = past_key_value[0].shape[1]
+                
+                # Ensure position_ids are correctly sliced
+                if position_ids.shape[1] > seq_length:
+                    position_ids = position_ids[:, -seq_length:]
         
-        # Compute attention scores and output
-        q = q.transpose(1, 2)  # [batch, heads, seq, dh]
-        k = k.transpose(1, 2)  # [batch, heads, seq, dh]
-        v = v.transpose(1, 2)  # [batch, heads, seq, dh]
+        # Compute key and value
+        c_kv = self.W_DKV(hidden_states)  # [batch, seq, dc]
+        k = self.W_UK(c_kv)  # [batch, seq, nh*dh]
+        v = self.W_UV(c_kv)  # [batch, seq, nh*dh]
         
-        # Process attention mask if provided
-        attention_mask_for_sdp = None
-        if attention_mask is not None:
-            # Convert attention_mask to the format expected by scaled_dot_product_attention
-            # [batch_size, seq_len] -> [batch_size, 1, 1, seq_len]
-            attention_mask_for_sdp = attention_mask.unsqueeze(1).unsqueeze(2)
-            # Convert mask from 0/1 to -inf/0
-            attention_mask_for_sdp = attention_mask_for_sdp.to(torch.float32)
-            attention_mask_for_sdp = (1.0 - attention_mask_for_sdp) * torch.finfo(q.dtype).min
-        
-        # Use Flash Attention if available for faster training
-        if HAS_FLASH_ATTENTION and attention_mask is None:
-            # Flash Attention expects input in shape [batch_size, seq_len, num_heads, head_dim]
-            q_flash = q.transpose(1, 2)  # [batch, seq, heads, dh]
-            k_flash = k.transpose(1, 2)  # [batch, seq, heads, dh]
-            v_flash = v.transpose(1, 2)  # [batch, seq, heads, dh]
-            
-            # Call Flash Attention
-            attn_output = flash_attn_func(
-                q_flash, k_flash, v_flash,
-                dropout_p=self.attention_dropout if self.training else 0.0,
-                softmax_scale=1.0 / math.sqrt(self.head_dim)
-            )
-            
-            # Reshape output
-            attn_output = attn_output.reshape(batch_size, seq_length, -1)
+        # Compute query
+        if hasattr(self, 'W_DQ') and hasattr(self, 'W_UQ'):
+            c_q = self.W_DQ(hidden_states)  # [batch, seq, d'c]
+            q = self.W_UQ(c_q)  # [batch, seq, nh*dh]
         else:
-            # Fall back to standard attention
-            attn_output = F.scaled_dot_product_attention(
-                q, k, v,
-                attn_mask=attention_mask_for_sdp,
-                dropout_p=self.attention_dropout,
-                scale=1.0 / math.sqrt(self.head_dim)
-            )
+            q = self.W_Q(hidden_states)  # [batch, seq, nh*dh]
+        
+        # Reshape q, k, v for multi-head attention
+        q = q.view(batch_size, seq_length, self.num_heads, self.head_dim)
+        k = k.view(batch_size, seq_length, self.num_heads, self.head_dim)
+        v = v.view(batch_size, seq_length, self.num_heads, self.head_dim)
+        
+        # Apply rotary position embeddings
+        if self.rope_dim_per_head > 0:
+            # Precompute freqs_cis if not already done
+            if self.cos is None or self.sin is None or self.max_seq_length < seq_length + past_length:
+                self.max_seq_length = max(self.max_seq_length, seq_length + past_length)
+                # Only apply RoPE to a subset of dimensions if specified
+                dim = min(self.rope_dim_per_head, self.head_dim)
+                self.cos, self.sin = precompute_freqs_cis(dim, self.max_seq_length * 2)
+                self.cos = self.cos.to(hidden_states.device)
+                self.sin = self.sin.to(hidden_states.device)
             
-            attn_output = attn_output.transpose(1, 2).reshape(batch_size, seq_length, -1)
+            # Get the appropriate part of position embeddings
+            # Ensure position_ids are within bounds
+            max_pos = self.cos.size(0) - 1
+            safe_pos_ids = torch.clamp(position_ids, 0, max_pos)
+            cos = self.cos.index_select(0, safe_pos_ids.view(-1)).view(batch_size, seq_length, -1)
+            sin = self.sin.index_select(0, safe_pos_ids.view(-1)).view(batch_size, seq_length, -1)
+            
+            # Convert to query/key dtype
+            cos = cos.to(q.dtype)
+            sin = sin.to(q.dtype)
+            
+            # Apply partial rotary if needed
+            if self.W_QR is not None and self.W_KR is not None:
+                # Project q and k to lower dimension for RoPE
+                q_flat = q.reshape(-1, self.head_dim)
+                k_flat = k.reshape(-1, self.head_dim)
+                
+                q_r = self.W_QR(q_flat).reshape(batch_size, seq_length, self.num_heads, self.rope_dim_per_head)
+                k_r = self.W_KR(k_flat).reshape(batch_size, seq_length, self.num_heads, self.rope_dim_per_head)
+                
+                # Apply rotary embeddings to the projected dimensions
+                q_r, k_r = apply_rotary_pos_emb(q_r, k_r, cos, sin)
+                
+                # Combine the rotary and non-rotary parts
+                q_rotary = q_r.reshape(-1, self.rope_dim_per_head)
+                k_rotary = k_r.reshape(-1, self.rope_dim_per_head)
+                
+                # Use the original tensors but replace the rotary part
+                q_flat[:, :self.rope_dim_per_head] = q_rotary
+                k_flat[:, :self.rope_dim_per_head] = k_rotary
+                
+                # Reshape back
+                q = q_flat.reshape(batch_size, seq_length, self.num_heads, self.head_dim)
+                k = k_flat.reshape(batch_size, seq_length, self.num_heads, self.head_dim)
+                
+                # Use the modified q and k as q_r and k_r
+                q_r, k_r = q, k
+            else:
+                # Apply full rotary embeddings
+                q_r, k_r = apply_rotary_pos_emb(q, k, cos, sin)
+        else:
+            q_r, k_r = q, k
         
-        output = self.W_O(attn_output)
+        # Extend k, v with past_key_value if provided
+        if past_key_value is not None:
+            k_r = torch.cat([past_key_value[0], k_r], dim=1)
+            v = torch.cat([past_key_value[1], v], dim=1)
         
-        return output, (c_kv, k_r)
+        # Save current k, v for future use
+        current_key_value = (k_r, v)
+        
+        # Transpose for attention computation
+        q_r = q_r.transpose(1, 2)  # [batch, num_heads, seq_length, head_dim]
+        k_r = k_r.transpose(1, 2)  # [batch, num_heads, kv_seq_length, head_dim]
+        v = v.transpose(1, 2)   # [batch, num_heads, kv_seq_length, head_dim]
+        
+        # Compute attention scores
+        attention_scores = torch.matmul(q_r, k_r.transpose(-1, -2))
+        attention_scores = attention_scores / math.sqrt(self.head_dim)
+        
+        # Apply attention mask if provided
+        if attention_mask is not None:
+            # Expand mask to match attention_scores dimensions
+            if attention_mask.dim() == 2:
+                attention_mask = attention_mask.unsqueeze(1).unsqueeze(1)
+            attention_mask = attention_mask.to(attention_scores.dtype)
+            attention_mask = (1.0 - attention_mask) * torch.finfo(attention_scores.dtype).min
+            attention_scores = attention_scores + attention_mask
+        
+        # Apply token temperature modulation if provided
+        if token_temperatures is not None:
+            # Reshape token_temperatures to match attention_scores
+            temps = token_temperatures.unsqueeze(1).unsqueeze(1)  # [batch, 1, 1, seq]
+            # Apply temperature scaling to attention scores
+            attention_scores = attention_scores * temps
+        
+        # Convert scores to probabilities
+        attention_probs = F.softmax(attention_scores, dim=-1)
+        
+        # Apply attention dropout
+        attention_probs = F.dropout(attention_probs, p=self.attention_dropout, training=self.training)
+        
+        # Compute context vectors
+        context = torch.matmul(attention_probs, v)
+        context = context.transpose(1, 2).contiguous()  # [batch, seq_length, num_heads, head_dim]
+        
+        # Reshape context back to [batch, seq, hidden_size]
+        context = context.view(batch_size, seq_length, self.hidden_size)
+        
+        # Apply output projection
+        output = self.W_O(context)
+        
+        return output, current_key_value
 
 class NSAAttention(nn.Module):
     """
@@ -249,106 +365,150 @@ class NSAAttention(nn.Module):
         return output, past_key_value
 
 class TokenTemperatureModulation(nn.Module):
-    """Token Temperature Modulation (TTM) mechanism for Quasar 3.0.
-    
-    TTM helps the model distinguish important tokens ("hot" tokens) from irrelevant ones ("cold" tokens).
-    This reduces hallucinations, token overuse, and overthinking by modulating attention based on token importance.
-    
-    The implementation calculates importance scores based on token frequency, position, and local context,
-    then uses these scores to adjust the loss function during training.
+    """
+    Token Temperature Modulation (TTM) mechanism for enhancing attention to important tokens.
+    This is implemented as a helper for Multi-Head Latent Attention, not as a replacement.
     """
     def __init__(self, config):
         super().__init__()
         self.config = config
         self.hidden_size = config.hidden_size
+        self.use_ttm = getattr(config, 'use_ttm', False)
         
-        # Hyperparameters for importance score calculation
-        self.alpha = getattr(config, 'ttm_alpha', 0.5)  # Weight for frequency score
-        self.beta = getattr(config, 'ttm_beta', 0.3)   # Weight for position score
-        self.gamma = getattr(config, 'ttm_gamma', 0.2)  # Weight for context score
+        # Temperature calculation networks
+        self.frequency_scorer = nn.Linear(self.hidden_size, 1)
+        self.position_scorer = nn.Linear(self.hidden_size, 1)
+        self.context_scorer = nn.Linear(self.hidden_size, 1)
         
-        # Context pattern detection via 1D convolutions
-        self.context_conv = nn.Sequential(
-            nn.Conv1d(self.hidden_size, self.hidden_size // 2, kernel_size=3, padding=1),
-            nn.GELU(),
-            nn.Conv1d(self.hidden_size // 2, 1, kernel_size=3, padding=1)
-        )
+        # Weights for different components
+        self.alpha = getattr(config, 'ttm_alpha', 0.5)  # Frequency weight
+        self.beta = getattr(config, 'ttm_beta', 0.3)    # Position weight
+        self.gamma = getattr(config, 'ttm_gamma', 0.2)  # Context weight
         
-        # Projection for calculating frequency score from embeddings
-        self.freq_projection = nn.Linear(self.hidden_size, 1)
-        
-    def calculate_frequency_score(self, hidden_states, input_ids=None):
-        """Calculate token frequency score.
-        
-        If input_ids are provided, we can use a lookup table approach.
-        Otherwise, we estimate from hidden states.
-        """
-        if input_ids is not None:
-            # This would ideally use a precomputed frequency table
-            # For now, we'll use a simple approximation based on token IDs
-            # Lower IDs tend to be more frequent in most tokenizers
-            batch_size, seq_len = input_ids.shape
-            max_id = self.config.vocab_size
-            freq_score = 1.0 - (input_ids.float() / max_id)
-            return freq_score.unsqueeze(-1)  # [batch, seq, 1]
-        else:
-            # Estimate frequency from hidden states
-            return torch.sigmoid(self.freq_projection(hidden_states))
+        # Initialize with proper scale
+        self._init_weights()
     
-    def calculate_position_score(self, seq_len, device):
-        """Calculate position-based importance score.
-        
-        Tokens at different positions have different importance.
-        Generally, earlier tokens provide more context.
-        """
-        position_indices = torch.arange(seq_len, device=device).float()
-        # Normalize positions to [0, 1] range and invert (earlier = more important)
-        position_score = 1.0 - (position_indices / seq_len)
-        return position_score.unsqueeze(0).unsqueeze(-1)  # [1, seq, 1]
-    
-    def calculate_context_score(self, hidden_states):
-        """Calculate context pattern score using convolutions.
-        
-        Detects local patterns that might indicate important contextual tokens.
-        """
-        # [batch, seq, hidden] -> [batch, hidden, seq]
-        hidden_states_t = hidden_states.transpose(1, 2)
-        context_score = self.context_conv(hidden_states_t)
-        # [batch, 1, seq] -> [batch, seq, 1]
-        return context_score.transpose(1, 2)
+    def _init_weights(self):
+        # Initialize with small weights to avoid disrupting attention at start
+        nn.init.normal_(self.frequency_scorer.weight, mean=0.0, std=0.02)
+        nn.init.normal_(self.position_scorer.weight, mean=0.0, std=0.02)
+        nn.init.normal_(self.context_scorer.weight, mean=0.0, std=0.02)
+        nn.init.zeros_(self.frequency_scorer.bias)
+        nn.init.zeros_(self.position_scorer.bias)
+        nn.init.zeros_(self.context_scorer.bias)
     
     def calculate_token_temperatures(self, hidden_states, input_ids=None):
-        """Calculate temperature for each token based on importance scores."""
-        batch_size, seq_len, _ = hidden_states.shape
-        device = hidden_states.device
+        """
+        Calculate temperature values for each token in the sequence.
         
-        # Calculate individual scores
-        freq_score = self.calculate_frequency_score(hidden_states, input_ids)
-        pos_score = self.calculate_position_score(seq_len, device)
-        context_score = self.calculate_context_score(hidden_states)
+        Args:
+            hidden_states: Tensor of shape [batch_size, seq_length, hidden_size]
+            input_ids: Optional tensor of shape [batch_size, seq_length]
+            
+        Returns:
+            temperatures: Tensor of shape [batch_size, seq_length]
+        """
+        if not self.use_ttm or not self.training:
+            # Return ones if TTM is disabled or during inference
+            return torch.ones(hidden_states.shape[0], hidden_states.shape[1], device=hidden_states.device)
         
-        # Combine scores: S(x_i) = α⋅f(x_i) + β⋅p(x_i) + γ⋅C(x_i)
-        importance_score = (
-            self.alpha * freq_score + 
-            self.beta * pos_score + 
-            self.gamma * context_score
+        # Calculate frequency score (how common/rare a token is)
+        frequency_score = self.frequency_scorer(hidden_states).squeeze(-1)
+        
+        # Calculate position score (importance based on position)
+        position_score = self.position_scorer(hidden_states).squeeze(-1)
+        
+        # Calculate context score (importance based on surrounding context)
+        context_score = self.context_scorer(hidden_states).squeeze(-1)
+        
+        # Combine scores with learned weights
+        temperatures = (
+            self.alpha * torch.sigmoid(frequency_score) + 
+            self.beta * torch.sigmoid(position_score) + 
+            self.gamma * torch.sigmoid(context_score)
         )
         
-        # Normalize scores across sequence
-        importance_sum = importance_score.sum(dim=1, keepdim=True) + 1e-6
-        token_temperatures = importance_score / importance_sum
+        # Normalize to have mean 1.0 to avoid changing overall attention scale
+        temperatures = temperatures * (temperatures.shape[1] / temperatures.sum(dim=1, keepdim=True))
         
-        return token_temperatures
+        return temperatures
     
-    def calculate_ttm_loss(self, lm_loss, token_temperatures):
-        """Calculate temperature-weighted loss to reinforce token-level focus."""
-        # Average temperature across sequence
-        mean_temp = token_temperatures.mean()
+    def calculate_ttm_loss(self, hidden_states, labels):
+        """
+        Calculate TTM loss to encourage focus on important tokens.
         
-        # Apply temperature weighting to language modeling loss
-        ttm_loss = lm_loss * mean_temp
+        Args:
+            hidden_states: Tensor of shape [batch_size, seq_length, hidden_size]
+            labels: Tensor of shape [batch_size, seq_length]
+            
+        Returns:
+            ttm_loss: Scalar tensor
+        """
+        if not self.use_ttm or not self.training:
+            return torch.tensor(0.0, device=hidden_states.device)
+        
+        # Get token temperatures
+        temperatures = self.calculate_token_temperatures(hidden_states)
+        
+        # Calculate entropy of temperature distribution
+        # We want to minimize entropy to encourage clear focus on specific tokens
+        temperature_probs = F.softmax(temperatures, dim=-1)
+        entropy = -torch.sum(temperature_probs * torch.log(temperature_probs + 1e-10), dim=-1).mean()
+        
+        # Calculate variance of temperatures
+        # We want to maximize variance to differentiate important from unimportant tokens
+        variance = torch.var(temperatures, dim=-1).mean()
+        
+        # Combined loss: minimize entropy, maximize variance
+        ttm_loss = entropy - 0.1 * variance
         
         return ttm_loss
+
+class MultiTokenPrediction(nn.Module):
+    """
+    Multi-Token Prediction (MTP) head for predicting multiple tokens at once.
+    """
+    def __init__(self, config):
+        super().__init__()
+        self.config = config
+        self.hidden_size = config.hidden_size
+        self.vocab_size = config.vocab_size
+        
+        # MTP projection head
+        self.mtp_head = nn.Linear(self.hidden_size, self.vocab_size)
+        
+        # Initialize weights
+        self._init_weights()
+    
+    def _init_weights(self):
+        # Initialize with same scale as main LM head
+        nn.init.normal_(self.mtp_head.weight, mean=0.0, std=0.02)
+        if hasattr(self.mtp_head, 'bias') and self.mtp_head.bias is not None:
+            nn.init.zeros_(self.mtp_head.bias)
+    
+    def forward(self, hidden_states, attention_mask=None, labels=None):
+        """
+        Forward pass for MTP.
+        
+        Args:
+            hidden_states: Tensor of shape [batch_size, seq_length, hidden_size]
+            attention_mask: Optional attention mask
+            labels: Optional labels for loss calculation
+            
+        Returns:
+            logits: Tensor of shape [batch_size, seq_length, vocab_size]
+            loss: Optional loss if labels are provided
+        """
+        # Project hidden states to vocabulary
+        logits = self.mtp_head(hidden_states)
+        
+        # Calculate loss if labels are provided
+        loss = None
+        if labels is not None and self.training:
+            loss_fct = nn.CrossEntropyLoss()
+            loss = loss_fct(logits.view(-1, self.vocab_size), labels.view(-1))
+        
+        return logits, loss
 
 class QuasarExpertFFN(nn.Module):
     def __init__(self, config):
@@ -444,69 +604,25 @@ class QuasarMoE(nn.Module):
         
         return x + shared_output + routed_output
 
-class MultiTokenPrediction(nn.Module):
-    def __init__(self, config):
-        super().__init__()
-        # D=1 MTP module to predict the next two tokens
-        self.transformer = QuasarTransformerBlock(config)
-        self.projection = nn.Linear(config.hidden_size, config.vocab_size)
-        
-    def forward(self, hidden_states, attention_mask=None, labels=None):
-        # Apply transformer block to get next token representations
-        mtp_hidden = self.transformer(hidden_states, attention_mask)
-        mtp_logits = self.projection(mtp_hidden)
-        
-        # Calculate MTP loss if labels are provided
-        mtp_loss = None
-        if labels is not None:
-            # Get the labels for the next two tokens
-            # For each position i, predict tokens at positions i+1 and i+2
-            # Shift labels for next token prediction
-            next_token_labels = labels[:, 1:] if labels.size(1) > 1 else None
-            
-            # Create padding mask - don't compute loss for padding tokens
-            if next_token_labels is not None and hasattr(config, 'pad_token_id'):
-                padding_mask = (next_token_labels != config.pad_token_id).float()
-                if hasattr(config, 'eos_token_id'):
-                    # Also compute loss for EOS token
-                    eos_mask = (next_token_labels == config.eos_token_id).float()
-                    padding_mask = padding_mask + eos_mask
-                    padding_mask = torch.clamp(padding_mask, 0, 1)
-                
-                # Compute cross entropy loss with masking
-                mtp_loss = F.cross_entropy(
-                    mtp_logits[:, :-1].reshape(-1, mtp_logits.size(-1)),
-                    next_token_labels.reshape(-1),
-                    reduction='none'
-                )
-                
-                # Apply padding mask and compute mean
-                mtp_loss = (mtp_loss * padding_mask.reshape(-1)).sum() / padding_mask.sum().clamp(min=1.0)
-            else:
-                # Fallback to standard loss if no padding mask
-                mtp_loss = F.cross_entropy(
-                    mtp_logits[:, :-1].reshape(-1, mtp_logits.size(-1)),
-                    next_token_labels.reshape(-1),
-                    ignore_index=-100
-                ) if next_token_labels is not None else None
-        
-        return mtp_logits, mtp_loss
-
 class QuasarTransformerBlock(nn.Module):
-    def __init__(self, config):
+    def __init__(self, config, layer_idx=None):
         super().__init__()
-        self.pre_attention_norm = RMSNorm(config.hidden_size)
+        self.config = config
+        self.layer_idx = layer_idx if layer_idx is not None else 0
         
-        # Choose attention mechanism based on config
+        # Pre-attention normalization
+        self.pre_attention_norm = RMSNorm(config.hidden_size, eps=config.layer_norm_epsilon)
+        
+        # Attention mechanism (MLA or NSA)
         if config.use_nsa:
             self.attention = NSAAttention(config)
         else:
             self.attention = MultiHeadLatentAttention(config)
-            
-        self.post_attention_norm = RMSNorm(config.hidden_size)
         
-        # Use MoE for all layers except the first if specified
-        self.layer_idx = getattr(self, 'layer_idx', 0)
+        # Post-attention normalization
+        self.post_attention_norm = RMSNorm(config.hidden_size, eps=config.layer_norm_epsilon)
+        
+        # Feed-forward network (standard or MoE)
         use_moe_for_this_layer = config.use_moe and (self.layer_idx > 0 or not config.first_layer_no_moe)
         
         if use_moe_for_this_layer:
@@ -514,7 +630,7 @@ class QuasarTransformerBlock(nn.Module):
         else:
             self.ffn = QuasarExpertFFN(config)
         
-        # Dropout for better regularization
+        # Dropout for regularization
         self.dropout = nn.Dropout(config.hidden_dropout_prob)
         
     def forward(self, hidden_states, attention_mask=None, past_key_value=None, position_ids=None, token_temperatures=None):
@@ -539,52 +655,76 @@ class QuasarTransformerBlock(nn.Module):
         return hidden_states, past_key_value
 
 class QuasarConfig:
-    def __init__(self):
-        # Model dimensions for 140B model with 32B active parameters
-        self.vocab_size = 128000
-        self.hidden_size = 4096  # d (reduced from 6144)
-        self.num_hidden_layers = 48  # L
-        self.num_attention_heads = 32  # nh
-        self.head_dim = 128  # dh
-        self.kv_compressed_dim = 512  # dc
-        self.query_compressed_dim = 1024  # d'c
-        self.rope_dim_per_head = 32  # dRh
-        self.intermediate_size = 14336  # 3.5x hidden_size
-        self.max_position_embeddings = 4096
+    def __init__(
+        self,
+        vocab_size=128128,
+        hidden_size=2048,
+        num_hidden_layers=20,
+        num_attention_heads=16,
+        head_dim=128,
+        intermediate_size=5632,
+        kv_compressed_dim=256,
+        query_compressed_dim=512,
+        rope_dim_per_head=32,
+        max_position_embeddings=4096,
+        attention_dropout_prob=0.0,
+        hidden_dropout_prob=0.0,
+        layer_norm_epsilon=1e-5,
+        initializer_range=0.02,
+        use_cache=True,
+        pad_token_id=0,
+        bos_token_id=1,
+        eos_token_id=2,
+        tie_word_embeddings=True,
+        use_moe=True,
+        num_experts=64,
+        num_experts_per_token=4,
+        moe_balance_loss_weight=0.01,
+        first_layer_no_moe=True,
+        num_shared_experts=1,
+        num_routed_experts=64,
+        use_ttm=True,
+        ttm_loss_weight=0.01,
+        mtp_loss_weight=0.1,
+        use_mtp=True,
+        use_nsa=False,
+        **kwargs
+    ):
+        self.vocab_size = vocab_size
+        self.hidden_size = hidden_size
+        self.num_hidden_layers = num_hidden_layers
+        self.num_attention_heads = num_attention_heads
+        self.head_dim = head_dim
+        self.intermediate_size = intermediate_size
+        self.kv_compressed_dim = kv_compressed_dim
+        self.query_compressed_dim = query_compressed_dim
+        self.rope_dim_per_head = rope_dim_per_head
+        self.max_position_embeddings = max_position_embeddings
+        self.attention_dropout_prob = attention_dropout_prob
+        self.hidden_dropout_prob = hidden_dropout_prob
+        self.layer_norm_epsilon = layer_norm_epsilon
+        self.initializer_range = initializer_range
+        self.use_cache = use_cache
+        self.pad_token_id = pad_token_id
+        self.bos_token_id = bos_token_id
+        self.eos_token_id = eos_token_id
+        self.tie_word_embeddings = tie_word_embeddings
+        self.use_moe = use_moe
+        self.num_experts = num_experts
+        self.num_experts_per_token = num_experts_per_token
+        self.moe_balance_loss_weight = moe_balance_loss_weight
+        self.first_layer_no_moe = first_layer_no_moe
+        self.num_shared_experts = num_shared_experts
+        self.num_routed_experts = num_routed_experts
+        self.use_ttm = use_ttm
+        self.ttm_loss_weight = ttm_loss_weight
+        self.mtp_loss_weight = mtp_loss_weight
+        self.use_mtp = use_mtp
+        self.use_nsa = use_nsa
         
-        # MoE parameters
-        self.num_shared_experts = 1  # Ns
-        self.num_routed_experts = 128  # Nr
-        self.top_k = 4  # k
-        self.load_balancing_gamma = 0.01  # γ
-        self.first_layer_no_moe = True  # First layer uses standard FFN
-        
-        # Attention mechanism
-        self.use_nsa = False  # Use Multi-Head Latent Attention by default
-        
-        # Other parameters
-        self.initializer_range = 0.006
-        self.use_moe = True  # Enable MoE for all layers except first
-        
-        # Training parameters
-        self.mtp_loss_weight = 0.2  # lambda for MTP loss
-        
-        # TTM parameters
-        self.use_ttm = True  # Enable Token Temperature Modulation
-        self.ttm_alpha = 0.5  # Weight for frequency score
-        self.ttm_beta = 0.3  # Weight for position score
-        self.ttm_gamma = 0.2  # Weight for context score
-        self.ttm_loss_weight = 0.15  # Weight for TTM loss component
-        
-        # Special token IDs - matching DeepSeek's implementation
-        self.pad_token_id = 0
-        self.bos_token_id = 1
-        self.eos_token_id = 2
-        self.unk_token_id = 3
-        
-        # Dropout rates - essential for regularization during pretraining
-        self.hidden_dropout_prob = 0.1
-        self.attention_dropout_prob = 0.1
+        # Process any additional kwargs
+        for key, value in kwargs.items():
+            setattr(self, key, value)
 
 class Quasar(nn.Module):
     def __init__(self, config):
@@ -600,16 +740,15 @@ class Quasar(nn.Module):
         # Main transformer layers
         self.layers = nn.ModuleList([])
         for i in range(config.num_hidden_layers):
-            layer = QuasarTransformerBlock(config)
-            layer.layer_idx = i  # Set layer index for MoE determination
+            layer = QuasarTransformerBlock(config, layer_idx=i)
             self.layers.append(layer)
         
         # Final layer norm
         self.final_norm = RMSNorm(config.hidden_size)
         
         # Output projection
-        self.output_projection = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
-        self.output_projection.weight = self.embed_tokens.weight  # Weight tying
+        self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
+        self.lm_head.weight = self.embed_tokens.weight  # Weight tying
         
         # Multi-token prediction module
         self.mtp = MultiTokenPrediction(config)
@@ -661,81 +800,96 @@ class Quasar(nn.Module):
         
         # Initialize past_key_values if None
         if past_key_values is None:
-            past_key_values = [None] * len(self.layers)
+            past_key_values = tuple([None] * len(self.layers))
             
         # Calculate token temperatures for TTM if enabled
         token_temperatures = None
-        if hasattr(self, 'ttm') and self.training:
+        if hasattr(self, 'ttm') and labels is not None:
             token_temperatures = self.ttm.calculate_token_temperatures(hidden_states, input_ids)
         
         # Process through transformer layers
+        all_hidden_states = []
+        new_past_key_values = []
         moe_balance_loss = 0.0
-        for i, layer in enumerate(self.layers):
-            past_key_value = past_key_values[i] if past_key_values is not None else None
+        
+        for i, (layer, past_key_value) in enumerate(zip(self.layers, past_key_values)):
+            all_hidden_states.append(hidden_states)
+            
             if self.gradient_checkpointing and self.training:
-                hidden_states, past_key_value = torch.utils.checkpoint.checkpoint(
-                    layer, 
+                # Use gradient checkpointing for memory efficiency
+                layer_outputs = torch.utils.checkpoint.checkpoint(
+                    layer,
                     hidden_states, 
                     attention_mask, 
                     past_key_value, 
                     position_ids,
-                    token_temperatures
+                    token_temperatures,
+                    use_reentrant=False  # Set to False as recommended
                 )
             else:
-                hidden_states, past_key_value = layer(
-                    hidden_states, 
-                    attention_mask=attention_mask, 
+                layer_outputs = layer(
+                    hidden_states,
+                    attention_mask=attention_mask,
                     past_key_value=past_key_value,
                     position_ids=position_ids,
                     token_temperatures=token_temperatures
                 )
             
+            hidden_states, past_key_value = layer_outputs
+            new_past_key_values.append(past_key_value)
+            
             # Accumulate MoE balance loss if available
-            if hasattr(layer.ffn, 'sequence_balance_loss'):
+            if hasattr(layer, 'ffn') and hasattr(layer.ffn, 'sequence_balance_loss'):
                 moe_balance_loss += layer.ffn.sequence_balance_loss
         
         # Final normalization
         hidden_states = self.final_norm(hidden_states)
+        all_hidden_states.append(hidden_states)
         
-        # Output projection
-        main_logits = self.output_projection(hidden_states)
-        
-        # Calculate main loss if labels are provided
+        # Calculate main loss (next token prediction)
+        main_logits = self.lm_head(hidden_states)
         main_loss = None
         if labels is not None:
-            # Shift logits and labels for next token prediction
+            # Shift so that tokens < n predict n
             shift_logits = main_logits[..., :-1, :].contiguous()
             shift_labels = labels[..., 1:].contiguous()
-            
-            # Calculate cross entropy loss
+            # Flatten the tokens
             loss_fct = nn.CrossEntropyLoss()
             main_loss = loss_fct(shift_logits.view(-1, self.config.vocab_size), shift_labels.view(-1))
         
-        # MTP output (predict next two tokens)
-        mtp_logits, mtp_loss = self.mtp(hidden_states, attention_mask, labels)
+        # Calculate multi-token prediction loss if enabled
+        mtp_loss = None
+        if hasattr(self, 'mtp') and self.training and getattr(self.config, 'use_mtp', False):
+            mtp_logits, mtp_loss = self.mtp(hidden_states, attention_mask, labels)
         
-        # Apply Token Temperature Modulation (TTM) to loss if enabled
+        # Calculate TTM loss if enabled
         ttm_loss = None
-        if hasattr(self, 'ttm') and main_loss is not None and self.training and token_temperatures is not None:
-            ttm_loss = self.ttm.calculate_ttm_loss(main_loss, token_temperatures)
+        if hasattr(self, 'ttm') and self.ttm.use_ttm and labels is not None:
+            ttm_loss = self.ttm.calculate_ttm_loss(hidden_states, labels)
         
-        # Total loss
+        # Combine losses
         loss = None
-        if main_loss is not None and mtp_loss is not None:
+        if main_loss is not None:
+            loss = main_loss
+            
+            if mtp_loss is not None:
+                loss += self.config.mtp_loss_weight * mtp_loss
+                
+            if moe_balance_loss > 0:
+                loss += self.config.moe_balance_loss_weight * moe_balance_loss
+                
             if ttm_loss is not None:
-                loss = main_loss + self.config.mtp_loss_weight * mtp_loss + moe_balance_loss + self.config.ttm_loss_weight * ttm_loss
-            else:
-                loss = main_loss + self.config.mtp_loss_weight * mtp_loss + moe_balance_loss
+                loss += self.config.ttm_loss_weight * ttm_loss
         
         return {
             'main_logits': main_logits,
-            'mtp_logits': mtp_logits,
             'loss': loss,
             'main_loss': main_loss,
             'mtp_loss': mtp_loss,
             'moe_balance_loss': moe_balance_loss,
             'ttm_loss': ttm_loss,
-            'hidden_states': hidden_states
+            'hidden_states': hidden_states,
+            'past_key_values': tuple(new_past_key_values) if new_past_key_values else None
         }
 
 def create_quasar_model(use_nsa=False):
