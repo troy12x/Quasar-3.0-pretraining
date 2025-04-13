@@ -19,6 +19,14 @@ import json
 from quasar import QuasarConfig, create_quasar_model
 import torch.cuda.amp as amp
 
+# Import DeepSpeed if available
+try:
+    import deepspeed
+    from deepspeed.ops.adam import DeepSpeedCPUAdam, FusedAdam
+    DEEPSPEED_AVAILABLE = True
+except ImportError:
+    DEEPSPEED_AVAILABLE = False
+
 # Setup logging
 logging.basicConfig(
     format="%(asctime)s - %(levelname)s - %(name)s - %(message)s",
@@ -34,14 +42,40 @@ class C4Dataset(Dataset):
         
         # Load C4 dataset from Hugging Face
         logger.info(f"Loading C4 dataset ({split} split)...")
-        self.dataset = load_dataset("c4", "en", split=split, cache_dir=cache_dir)
-        logger.info(f"Loaded {len(self.dataset)} examples")
+        try:
+            self.dataset = load_dataset("c4", "en", split=split, cache_dir=cache_dir)
+            logger.info(f"Loaded {len(self.dataset)} examples")
+        except Exception as e:
+            logger.warning(f"Failed to load C4 dataset: {e}")
+            logger.info("Falling back to a smaller dataset (wikitext)...")
+            try:
+                self.dataset = load_dataset("wikitext", "wikitext-103-v1", split=split, cache_dir=cache_dir)
+                logger.info(f"Loaded {len(self.dataset)} examples from wikitext")
+            except Exception as e2:
+                logger.error(f"Failed to load fallback dataset: {e2}")
+                # Create a small dummy dataset for testing
+                logger.info("Using a dummy dataset for testing")
+                from datasets import Dataset as HFDataset
+                dummy_data = [{"text": "This is a dummy text for testing the Quasar model."} for _ in range(100)]
+                self.dataset = HFDataset.from_dict({"text": [item["text"] for item in dummy_data]})
         
     def __len__(self):
         return len(self.dataset)
     
     def __getitem__(self, idx):
-        text = self.dataset[idx]["text"]
+        # Handle different dataset formats (C4 vs Wikitext)
+        if "text" in self.dataset[idx]:
+            text = self.dataset[idx]["text"]
+        elif "page" in self.dataset[idx]:  # For Wikitext
+            text = self.dataset[idx]["page"]
+        else:
+            # Get the first field that contains text
+            for key, value in self.dataset[idx].items():
+                if isinstance(value, str) and len(value) > 0:
+                    text = value
+                    break
+            else:
+                text = "This is a fallback text for empty examples."
         
         # Tokenize text
         encodings = self.tokenizer(
@@ -83,7 +117,7 @@ def get_parameter_count(model):
 
 def train(args, rank, world_size):
     # Set up distributed training if needed
-    if args.distributed:
+    if args.distributed and not args.deepspeed:
         setup_distributed(rank, world_size)
     
     # Set random seeds for reproducibility
@@ -123,7 +157,7 @@ def train(args, rank, world_size):
         cache_dir=args.cache_dir
     )
     
-    if args.distributed:
+    if args.distributed and not args.deepspeed:
         train_sampler = DistributedSampler(train_dataset)
         val_sampler = DistributedSampler(val_dataset, shuffle=False)
     else:
@@ -159,33 +193,114 @@ def train(args, rank, world_size):
     param_count = get_parameter_count(model)
     logger.info(f"Model created with {param_count/1e9:.2f}B parameters")
     
-    # Move model to GPU and setup DDP if needed
-    model = model.to(rank)
-    if args.distributed:
-        model = DDP(model, device_ids=[rank])
-    
-    # Setup optimizer and scheduler
-    optimizer = optim.AdamW(
-        model.parameters(),
-        lr=args.learning_rate,
-        weight_decay=args.weight_decay,
-        betas=(args.adam_beta1, args.adam_beta2),
-        eps=args.adam_epsilon
-    )
+    # Setup optimizer parameters
+    optimizer_params = {
+        "lr": args.learning_rate,
+        "weight_decay": args.weight_decay,
+        "betas": (args.adam_beta1, args.adam_beta2),
+        "eps": args.adam_epsilon
+    }
     
     # Calculate total training steps
     total_steps = len(train_loader) * args.num_epochs
-    warmup_steps = int(total_steps * args.warmup_ratio)
+    if hasattr(args, 'warmup_steps') and args.warmup_steps > 0:
+        warmup_steps = args.warmup_steps
+    else:
+        warmup_steps = int(total_steps * args.warmup_ratio)
     
-    # Learning rate scheduler with warmup
-    def lr_lambda(current_step):
-        if current_step < warmup_steps:
-            return float(current_step) / float(max(1, warmup_steps))
-        return max(
-            0.0, float(total_steps - current_step) / float(max(1, total_steps - warmup_steps))
+    # DeepSpeed integration
+    if args.deepspeed and DEEPSPEED_AVAILABLE:
+        logger.info("Initializing DeepSpeed...")
+        # Load DeepSpeed config
+        ds_config = None
+        if os.path.exists(args.deepspeed_config):
+            with open(args.deepspeed_config, 'r') as f:
+                ds_config = json.load(f)
+        else:
+            logger.warning(f"DeepSpeed config file {args.deepspeed_config} not found. Using default config.")
+            ds_config = {
+                "train_batch_size": args.batch_size * world_size * args.gradient_accumulation_steps,
+                "gradient_accumulation_steps": args.gradient_accumulation_steps,
+                "optimizer": {
+                    "type": args.optimizer.capitalize(),
+                    "params": optimizer_params
+                },
+                "fp16": {
+                    "enabled": args.precision == "fp16"
+                },
+                "bf16": {
+                    "enabled": args.precision == "bf16"
+                },
+                "scheduler": {
+                    "type": "WarmupDecayLR",
+                    "params": {
+                        "warmup_min_lr": 0,
+                        "warmup_max_lr": args.learning_rate,
+                        "warmup_num_steps": warmup_steps,
+                        "total_num_steps": total_steps
+                    }
+                },
+                "zero_optimization": {
+                    "stage": 3,
+                    "offload_optimizer": {
+                        "device": "cpu"
+                    },
+                    "offload_param": {
+                        "device": "cpu"
+                    },
+                    "overlap_comm": True,
+                    "contiguous_gradients": True,
+                    "reduce_bucket_size": 5e8,
+                    "stage3_prefetch_bucket_size": 5e8,
+                    "stage3_param_persistence_threshold": 1e6
+                },
+                "steps_per_print": args.logging_steps,
+                "wall_clock_breakdown": False
+            }
+        
+        # Initialize DeepSpeed
+        model, optimizer, _, scheduler = deepspeed.initialize(
+            model=model,
+            model_parameters=model.parameters(),
+            config=ds_config,
+            dist_init_required=True
         )
-    
-    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
+    else:
+        # Standard training setup (non-DeepSpeed)
+        # Move model to GPU and setup DDP if needed
+        model = model.to(rank)
+        if args.distributed:
+            model = DDP(model, device_ids=[rank])
+        
+        # Setup optimizer
+        if args.optimizer == "adamw":
+            optimizer = optim.AdamW(model.parameters(), **optimizer_params)
+        elif args.optimizer == "adam":
+            optimizer = optim.Adam(model.parameters(), **optimizer_params)
+        elif args.optimizer == "sgd":
+            optimizer = optim.SGD(model.parameters(), lr=args.learning_rate)
+        elif args.optimizer == "adafactor":
+            optimizer = optim.Adafactor(model.parameters(), **optimizer_params)
+        
+        # Learning rate scheduler with warmup
+        if args.lr_scheduler == "linear":
+            def lr_lambda(current_step):
+                if current_step < warmup_steps:
+                    return float(current_step) / float(max(1, warmup_steps))
+                return max(
+                    0.0, float(total_steps - current_step) / float(max(1, total_steps - warmup_steps))
+                )
+            scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
+        elif args.lr_scheduler == "cosine":
+            scheduler = CosineAnnealingLR(optimizer, T_max=total_steps, eta_min=1e-6)
+        elif args.lr_scheduler == "constant":
+            scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lambda step: 1.0)
+        elif args.lr_scheduler == "constant_with_warmup":
+            def lr_lambda(current_step):
+                if current_step < warmup_steps:
+                    return float(current_step) / float(max(1, warmup_steps))
+                return 1.0
+            scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
     
     # Resume from checkpoint if specified
     start_epoch = 0
@@ -215,86 +330,112 @@ def train(args, rank, world_size):
     
     # Training loop
     logger.info("Starting training...")
-    scaler = amp.GradScaler(enabled=args.precision in ["fp16", "bf16"])
+    scaler = amp.GradScaler(enabled=args.precision in ["fp16", "bf16"] and not args.deepspeed)
     
     for epoch in range(start_epoch, args.num_epochs):
         model.train()
         epoch_loss = 0.0
         
-        if args.distributed:
+        if args.distributed and not args.deepspeed:
             train_sampler.set_epoch(epoch)
         
         progress_bar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{args.num_epochs}")
         
-        # Zero gradients at the beginning of each epoch
-        optimizer.zero_grad()
+        # Zero gradients at the beginning of each epoch (for non-DeepSpeed)
+        if not args.deepspeed:
+            optimizer.zero_grad()
         
         for step, batch in enumerate(progress_bar):
-            # Move batch to device
-            batch = {k: v.to(rank) for k, v in batch.items()}
+            # Move batch to device (not needed for DeepSpeed)
+            if not args.deepspeed:
+                batch = {k: v.to(rank) for k, v in batch.items()}
             
-            # Forward pass with appropriate precision
-            if args.precision in ["fp16", "bf16"]:
-                with amp.autocast(dtype=torch.bfloat16 if args.precision == "bf16" else torch.float16):
+            # DeepSpeed handles mixed precision internally
+            if args.deepspeed:
+                # Forward pass with DeepSpeed
+                outputs = model(**batch)
+                loss = outputs["loss"]
+                
+                # Backward pass with DeepSpeed
+                model.backward(loss)
+                
+                # Update parameters with DeepSpeed
+                if (step + 1) % args.gradient_accumulation_steps == 0 or step == len(train_loader) - 1:
+                    model.step()
+            else:
+                # Standard training path (non-DeepSpeed)
+                # Forward pass with appropriate precision
+                if args.precision in ["fp16", "bf16"]:
+                    with amp.autocast(dtype=torch.bfloat16 if args.precision == "bf16" else torch.float16):
+                        outputs = model(**batch)
+                        # Scale loss by gradient accumulation steps
+                        loss = outputs["loss"] / args.gradient_accumulation_steps
+                else:
                     outputs = model(**batch)
                     # Scale loss by gradient accumulation steps
                     loss = outputs["loss"] / args.gradient_accumulation_steps
-            else:
-                outputs = model(**batch)
-                # Scale loss by gradient accumulation steps
-                loss = outputs["loss"] / args.gradient_accumulation_steps
-            
-            # Backward pass with mixed precision if enabled
-            if args.precision in ["fp16", "bf16"]:
-                scaler.scale(loss).backward()
-            else:
-                loss.backward()
-            
-            # Update parameters every gradient_accumulation_steps
-            if (step + 1) % args.gradient_accumulation_steps == 0 or step == len(train_loader) - 1:
-                # Gradient clipping
-                if args.precision in ["fp16", "bf16"]:
-                    scaler.unscale_(optimizer)
                 
-                torch.nn.utils.clip_grad_norm_(model.parameters(), args.max_grad_norm)
-                
-                # Update parameters with mixed precision if enabled
+                # Backward pass with mixed precision if enabled
                 if args.precision in ["fp16", "bf16"]:
-                    scaler.step(optimizer)
-                    scaler.update()
+                    scaler.scale(loss).backward()
                 else:
-                    optimizer.step()
+                    loss.backward()
                 
-                # Update learning rate
-                scheduler.step()
-                
-                # Zero gradients
-                optimizer.zero_grad()
+                # Update parameters every gradient_accumulation_steps
+                if (step + 1) % args.gradient_accumulation_steps == 0 or step == len(train_loader) - 1:
+                    # Gradient clipping
+                    if args.precision in ["fp16", "bf16"]:
+                        scaler.unscale_(optimizer)
+                    
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), args.max_grad_norm)
+                    
+                    # Update parameters with mixed precision if enabled
+                    if args.precision in ["fp16", "bf16"]:
+                        scaler.step(optimizer)
+                        scaler.update()
+                    else:
+                        optimizer.step()
+                    
+                    # Update learning rate
+                    scheduler.step()
+                    
+                    # Zero gradients
+                    optimizer.zero_grad()
+            
+            # Get loss value for logging
+            if args.deepspeed:
+                loss_value = loss.item()
+            else:
+                loss_value = loss.item() * args.gradient_accumulation_steps  # Scale back to get the actual loss
             
             # Update progress
             global_step += 1
-            epoch_loss += loss.item() * args.gradient_accumulation_steps  # Scale back to get the actual loss
-            progress_bar.set_postfix({"loss": loss.item() * args.gradient_accumulation_steps, "lr": scheduler.get_last_lr()[0]})
+            epoch_loss += loss_value
+            progress_bar.set_postfix({"loss": loss_value, "lr": scheduler.get_last_lr()[0] if not args.deepspeed else model.get_lr()[0]})
             
             # Log to wandb
             if rank == 0 and args.use_wandb and global_step % args.logging_steps == 0:
                 wandb.log({
-                    "train/loss": loss.item() * args.gradient_accumulation_steps,
-                    "train/learning_rate": scheduler.get_last_lr()[0],
+                    "train/loss": loss_value,
+                    "train/learning_rate": scheduler.get_last_lr()[0] if not args.deepspeed else model.get_lr()[0],
                     "train/epoch": epoch + (progress_bar.n / len(progress_bar)),
                     "train/global_step": global_step
                 })
             
             # Save checkpoint
             if rank == 0 and global_step % args.save_steps == 0:
-                save_checkpoint(model, optimizer, scheduler, epoch, global_step, args)
+                if args.deepspeed:
+                    # DeepSpeed handles saving checkpoints
+                    model.save_checkpoint(args.output_dir, f"checkpoint-{global_step}")
+                else:
+                    save_checkpoint(model, optimizer, scheduler, epoch, global_step, args)
         
         # Calculate average epoch loss
         epoch_loss /= len(train_loader)
         logger.info(f"Epoch {epoch+1}/{args.num_epochs} - Average Loss: {epoch_loss:.4f}")
         
         # Validation
-        val_loss = evaluate(model, val_loader, rank)
+        val_loss = evaluate(model, val_loader, rank, is_deepspeed=args.deepspeed)
         logger.info(f"Epoch {epoch+1}/{args.num_epochs} - Validation Loss: {val_loss:.4f}")
         
         # Log validation metrics
@@ -324,17 +465,22 @@ def train(args, rank, world_size):
     if args.distributed:
         cleanup_distributed()
 
-def evaluate(model, dataloader, device):
+def evaluate(model, dataloader, device, is_deepspeed=False):
     """Evaluate the model on the validation set."""
     model.eval()
     total_loss = 0.0
     with torch.no_grad():
         for batch in tqdm(dataloader, desc="Evaluating"):
-            # Move batch to device
-            batch = {k: v.to(device) for k, v in batch.items()}
+            # Move batch to device (not needed for DeepSpeed)
+            if not is_deepspeed:
+                batch = {k: v.to(device) for k, v in batch.items()}
             
             # Forward pass
-            outputs = model(**batch)
+            if is_deepspeed:
+                outputs = model(**batch)
+            else:
+                outputs = model(**batch)
+                
             loss = outputs["loss"]
             
             total_loss += loss.item()
@@ -390,10 +536,19 @@ def main():
     parser.add_argument("--adam_epsilon", type=float, default=1e-8, help="Adam epsilon")
     parser.add_argument("--max_grad_norm", type=float, default=1.0, help="Max gradient norm")
     
+    # Optimizer and scheduler arguments
+    parser.add_argument("--optimizer", type=str, default="adamw", choices=["adamw", "adam", "sgd", "adafactor"],
+                        help="Optimizer to use for training")
+    parser.add_argument("--warmup_steps", type=int, default=1000, help="Number of steps for linear warmup")
+    parser.add_argument("--lr_scheduler", type=str, default="cosine", 
+                        choices=["linear", "cosine", "constant", "constant_with_warmup"],
+                        help="Learning rate scheduler type")
+    
     # Logging and saving arguments
     parser.add_argument("--output_dir", type=str, default="./checkpoints", help="Output directory")
     parser.add_argument("--logging_steps", type=int, default=100, help="Logging steps")
     parser.add_argument("--save_steps", type=int, default=5000, help="Save steps")
+    parser.add_argument("--eval_steps", type=int, default=1000, help="Run evaluation every X updates steps")
     parser.add_argument("--run_name", type=str, default="quasar-pretrain", help="Run name for wandb")
     parser.add_argument("--use_wandb", action="store_true", help="Whether to use wandb")
     
@@ -418,7 +573,11 @@ def main():
     os.makedirs(args.output_dir, exist_ok=True)
     
     # Launch training
-    if args.distributed:
+    if args.deepspeed and DEEPSPEED_AVAILABLE:
+        # DeepSpeed handles distributed training internally
+        logger.info("Using DeepSpeed for distributed training")
+        train(args, 0, args.world_size)
+    elif args.distributed:
         import torch.multiprocessing as mp
         mp.spawn(train, args=(args, args.world_size), nprocs=args.world_size, join=True)
     else:
