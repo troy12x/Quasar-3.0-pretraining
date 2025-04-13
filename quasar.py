@@ -48,47 +48,49 @@ def apply_rotary_pos_emb(q: torch.Tensor, k: torch.Tensor, cos: torch.Tensor, si
     # Get dimensions
     batch_size, seq_len, num_heads, head_dim = q.shape
     
-    # First, ensure cos and sin have the right dimensions
-    # They should be [seq_len, head_dim] or [batch, seq_len, head_dim]
-    if cos.dim() > 2:
-        # If cos has more than 2 dimensions, extract the last 2 dimensions
-        cos = cos.view(-1, *cos.shape[-2:])[-seq_len:]
-        sin = sin.view(-1, *sin.shape[-2:])[-seq_len:]
+    # Handle different cos/sin tensor shapes
+    if cos.dim() == 2:
+        # Shape [seq_len, dim]
+        cos = cos.unsqueeze(0).unsqueeze(2)  # [1, seq_len, 1, dim]
+        sin = sin.unsqueeze(0).unsqueeze(2)  # [1, seq_len, 1, dim]
+    elif cos.dim() == 3:
+        # Shape [batch, seq_len, dim]
+        cos = cos.unsqueeze(2)  # [batch, seq_len, 1, dim]
+        sin = sin.unsqueeze(2)  # [batch, seq_len, 1, dim]
     
-    # Ensure cos and sin have the right sequence length
-    if cos.size(0) > seq_len:
-        cos = cos[:seq_len]
-        sin = sin[:seq_len]
-    elif cos.size(0) < seq_len:
+    # Ensure the sequence length matches
+    if cos.size(1) < seq_len:
         # Pad if needed (should be rare)
-        pad_len = seq_len - cos.size(0)
-        # Create padding with the right dimensions
-        cos_padding = cos[-1:].expand(pad_len, cos.size(1))
-        sin_padding = sin[-1:].expand(pad_len, sin.size(1))
-        cos = torch.cat([cos, cos_padding], dim=0)
-        sin = torch.cat([sin, sin_padding], dim=0)
+        pad_len = seq_len - cos.size(1)
+        cos_padding = cos[:, -1:].expand(-1, pad_len, -1, -1)
+        sin_padding = sin[:, -1:].expand(-1, pad_len, -1, -1)
+        cos = torch.cat([cos, cos_padding], dim=1)
+        sin = torch.cat([sin, sin_padding], dim=1)
+    elif cos.size(1) > seq_len:
+        # Truncate if needed
+        cos = cos[:, :seq_len]
+        sin = sin[:, :seq_len]
     
-    # Ensure cos and sin have the right feature dimension
-    if cos.size(1) > head_dim:
-        cos = cos[:, :head_dim]
-        sin = sin[:, :head_dim]
-    elif cos.size(1) < head_dim:
-        # Pad with zeros
-        pad_dim = head_dim - cos.size(1)
+    # Ensure the feature dimension matches
+    feature_dim = cos.size(-1)
+    if feature_dim < head_dim:
+        # Pad with zeros if needed
+        pad_dim = head_dim - feature_dim
         cos = F.pad(cos, (0, pad_dim))
         sin = F.pad(sin, (0, pad_dim))
+    elif feature_dim > head_dim:
+        # Truncate if needed
+        cos = cos[..., :head_dim]
+        sin = sin[..., :head_dim]
     
-    # Reshape for broadcasting: [seq_len, head_dim] -> [1, seq_len, 1, head_dim]
-    cos = cos.view(1, seq_len, 1, head_dim)
-    sin = sin.view(1, seq_len, 1, head_dim)
+    # Expand to match batch size and number of heads
+    if cos.size(0) == 1 and batch_size > 1:
+        cos = cos.expand(batch_size, -1, -1, -1)
+        sin = sin.expand(batch_size, -1, -1, -1)
     
-    # Repeat for all heads if needed
-    cos = cos.expand(1, 1, num_heads, 1)
-    sin = sin.expand(1, 1, num_heads, 1)
-    
-    # Repeat for batch dimension
-    cos = cos.expand(batch_size, 1, 1, 1)
-    sin = sin.expand(batch_size, 1, 1, 1)
+    if cos.size(2) == 1 and num_heads > 1:
+        cos = cos.expand(-1, -1, num_heads, -1)
+        sin = sin.expand(-1, -1, num_heads, -1)
     
     # Apply rotary embeddings
     q_embed = (q * cos) + (rotate_half(q) * sin)
@@ -205,8 +207,28 @@ class MultiHeadLatentAttention(nn.Module):
             # Ensure position_ids are within bounds
             max_pos = self.cos.size(0) - 1
             safe_pos_ids = torch.clamp(position_ids, 0, max_pos)
-            cos = self.cos.index_select(0, safe_pos_ids.view(-1)).view(batch_size, seq_length, -1)
-            sin = self.sin.index_select(0, safe_pos_ids.view(-1)).view(batch_size, seq_length, -1)
+            
+            # Use gather instead of index_select for better handling of batched position_ids
+            # This handles both 1D and 2D position_ids correctly
+            if safe_pos_ids.dim() == 2:
+                # For batched position_ids [batch_size, seq_length]
+                cos_seq = self.cos[None, :, :].expand(batch_size, -1, -1)
+                sin_seq = self.sin[None, :, :].expand(batch_size, -1, -1)
+                
+                # Create indices for gather
+                batch_indices = torch.arange(batch_size, device=safe_pos_ids.device)[:, None]
+                batch_indices = batch_indices.expand(-1, seq_length)
+                
+                # Gather using the position_ids
+                cos = cos_seq.gather(1, safe_pos_ids.unsqueeze(-1).expand(-1, -1, cos_seq.size(-1)))
+                sin = sin_seq.gather(1, safe_pos_ids.unsqueeze(-1).expand(-1, -1, sin_seq.size(-1)))
+            else:
+                # For single position_ids [seq_length]
+                cos = self.cos[safe_pos_ids]
+                sin = self.sin[safe_pos_ids]
+                # Reshape to [1, seq_length, dim]
+                cos = cos.unsqueeze(0)
+                sin = sin.unsqueeze(0)
             
             # Convert to query/key dtype
             cos = cos.to(q.dtype)
@@ -525,10 +547,15 @@ class QuasarMoE(nn.Module):
     def __init__(self, config):
         super().__init__()
         self.hidden_size = config.hidden_size
-        self.num_shared_experts = config.num_shared_experts  # Ns
-        self.num_routed_experts = config.num_routed_experts  # Nr
-        self.top_k = config.top_k  # Kr
-        self.alpha = config.load_balancing_alpha  # Alpha for sequence-wise auxiliary loss
+        self.intermediate_size = config.intermediate_size
+        
+        # MoE parameters
+        self.num_experts = getattr(config, 'num_experts', 64)  # Ne
+        self.num_shared_experts = getattr(config, 'num_shared_experts', 1)  # Ns
+        self.num_routed_experts = getattr(config, 'num_routed_experts', 64)  # Nr
+        self.top_k = getattr(config, 'top_k', 4)  # Kr
+        self.alpha = getattr(config, 'load_balancing_alpha', 0.01)  # Alpha for sequence-wise auxiliary loss
+        self.gamma = getattr(config, 'load_balancing_gamma', 0.01)  # Gamma for token-wise auxiliary loss
         
         # Shared experts
         self.shared_experts = nn.ModuleList([
@@ -543,7 +570,7 @@ class QuasarMoE(nn.Module):
         # Router
         self.router = nn.Linear(self.hidden_size, self.num_routed_experts)
         self.expert_biases = nn.Parameter(torch.zeros(self.num_routed_experts))
-        self.gamma = config.load_balancing_gamma
+        # gamma is already defined above
         
     def forward(self, x, update_biases=True):
         batch_size, seq_len = x.shape[:2]
@@ -564,45 +591,80 @@ class QuasarMoE(nn.Module):
         gates = F.normalize(scores, p=1, dim=-1)  # Normalize for weighted sum
         
         # Process with shared experts
-        shared_output = sum(expert(x) for expert in self.shared_experts)
+        shared_output = torch.zeros_like(x)
+        for i in range(self.num_shared_experts):
+            shared_output += self.shared_experts[i](x)
+        shared_output /= self.num_shared_experts
         
-        # Process with routed experts
+        # Process with routed experts - use a deterministic approach for gradient checkpointing
         routed_output = torch.zeros_like(x)
+        
+        # Deterministic processing of experts
+        # This approach ensures the same number of tensors are created during forward and recomputation
         for k in range(self.top_k):
             expert_idx = indices[..., k]
             gate = gates[..., k:k+1]
+            
+            # Create a flattened version for processing
+            flat_x = x.reshape(-1, x.size(-1))
+            flat_expert_idx = expert_idx.reshape(-1)
+            flat_gate = gate.reshape(-1, 1)
+            
+            # Process each expert in a deterministic way
             for i in range(self.num_routed_experts):
-                mask = (expert_idx == i)
-                if mask.any():
-                    expert_input = x[mask]
-                    expert_output = self.routed_experts[i](expert_input)
-                    routed_output[mask] += gate[mask] * expert_output
+                # Create binary mask for this expert
+                expert_mask = (flat_expert_idx == i)
+                # Apply the mask to get inputs for this expert
+                # Convert mask to same dtype as x to avoid dtype mismatch
+                mask_tensor = expert_mask.unsqueeze(-1).to(dtype=x.dtype)
+                masked_input = flat_x * mask_tensor
+                # Process all inputs (most will be zeros)
+                expert_output = self.routed_experts[i](masked_input)
+                # Apply gate values (also masked)
+                gated_output = expert_output * (flat_gate * mask_tensor)
+                # Add to the output
+                routed_output += gated_output.reshape(x.shape)
         
-        # Update biases based on expert load
+        # Combine outputs
+        output = shared_output + routed_output
+        
+        # Update biases based on expert load - only during training
         if update_biases and self.training:
             # Calculate expert counts for batch-wise load balancing
-            expert_counts = torch.zeros(self.num_routed_experts, device=x.device)
+            expert_counts = torch.zeros(self.num_routed_experts, device=x.device, dtype=x.dtype)
+            
+            # Deterministic approach to count experts
+            flat_indices = indices.reshape(-1)
             for i in range(self.num_routed_experts):
-                expert_counts[i] = (indices == i).float().sum()
+                expert_counts[i] = (flat_indices == i).to(dtype=x.dtype).sum()
+                    
             target_count = (batch_size * seq_len * self.top_k) / self.num_routed_experts
             load_diff = expert_counts - target_count
-            self.expert_biases.data -= self.gamma * load_diff
+            
+            # Update biases
+            with torch.no_grad():
+                self.expert_biases.data -= self.gamma * load_diff.to(self.expert_biases.dtype)
+            
+            # Compute sequence-wise auxiliary loss (L_Bal) - deterministic approach
+            sequence_counts = torch.zeros(batch_size, self.num_routed_experts, device=x.device, dtype=x.dtype)
+            
+            # Reshape indices to [batch, seq*top_k] for deterministic processing
+            reshaped_indices = indices.reshape(batch_size, -1)
+            for i in range(self.num_routed_experts):
+                sequence_counts[:, i] = (reshaped_indices == i).to(dtype=x.dtype).sum(dim=1)
             
             # Compute sequence-wise auxiliary loss (L_Bal)
-            # This is a complementary loss to prevent extreme sequence imbalance
-            sequence_counts = torch.zeros(batch_size, self.num_routed_experts, device=x.device)
-            for i in range(self.num_routed_experts):
-                sequence_counts[:, i] = (indices == i).float().sum(dim=1)  # Sum over sequence dimension
             sequence_fractions = sequence_counts / (seq_len * self.top_k)
             target_fraction = 1.0 / self.num_routed_experts
-            sequence_loss = F.mse_loss(sequence_fractions, torch.full_like(sequence_fractions, target_fraction))
+            target_tensor = torch.full_like(sequence_fractions, target_fraction)
+            sequence_loss = F.mse_loss(sequence_fractions, target_tensor)
             
             # Store the loss for later use in the training objective
             self.sequence_balance_loss = self.alpha * sequence_loss
         else:
             self.sequence_balance_loss = 0.0
         
-        return x + shared_output + routed_output
+        return output
 
 class QuasarTransformerBlock(nn.Module):
     def __init__(self, config, layer_idx=None):
@@ -658,13 +720,13 @@ class QuasarConfig:
     def __init__(
         self,
         vocab_size=128128,
-        hidden_size=2048,
-        num_hidden_layers=20,
-        num_attention_heads=16,
+        hidden_size=1536,  # Reduced from 2048
+        num_hidden_layers=12,  # Reduced from 20
+        num_attention_heads=12,  # Reduced from 16
         head_dim=128,
-        intermediate_size=5632,
-        kv_compressed_dim=256,
-        query_compressed_dim=512,
+        intermediate_size=4096,  # Reduced from 5632
+        kv_compressed_dim=192,  # Reduced from 256
+        query_compressed_dim=384,  # Reduced from 512
         rope_dim_per_head=32,
         max_position_embeddings=4096,
         attention_dropout_prob=0.0,
@@ -677,12 +739,15 @@ class QuasarConfig:
         eos_token_id=2,
         tie_word_embeddings=True,
         use_moe=True,
-        num_experts=64,
+        num_experts=16,  # Reduced from 64
         num_experts_per_token=4,
         moe_balance_loss_weight=0.01,
         first_layer_no_moe=True,
         num_shared_experts=1,
-        num_routed_experts=64,
+        num_routed_experts=16,  # Reduced from 64
+        top_k=4,
+        load_balancing_alpha=0.01,
+        load_balancing_gamma=0.01,
         use_ttm=True,
         ttm_loss_weight=0.01,
         mtp_loss_weight=0.1,
@@ -716,6 +781,9 @@ class QuasarConfig:
         self.first_layer_no_moe = first_layer_no_moe
         self.num_shared_experts = num_shared_experts
         self.num_routed_experts = num_routed_experts
+        self.top_k = top_k
+        self.load_balancing_alpha = load_balancing_alpha
+        self.load_balancing_gamma = load_balancing_gamma
         self.use_ttm = use_ttm
         self.ttm_loss_weight = ttm_loss_weight
         self.mtp_loss_weight = mtp_loss_weight
@@ -817,8 +885,13 @@ class Quasar(nn.Module):
             
             if self.gradient_checkpointing and self.training:
                 # Use gradient checkpointing for memory efficiency
+                def create_custom_forward(module):
+                    def custom_forward(*inputs):
+                        return module(*inputs)
+                    return custom_forward
+                
                 layer_outputs = torch.utils.checkpoint.checkpoint(
-                    layer,
+                    create_custom_forward(layer),
                     hidden_states, 
                     attention_mask, 
                     past_key_value, 
@@ -909,9 +982,3 @@ def create_quasar_model(use_nsa=False):
     print(f"Model dimensions: hidden_size={config.hidden_size}, layers={config.num_hidden_layers}, heads={config.num_attention_heads}")
     
     return model
-
-# Example usage:
-# model = create_quasar_model(use_nsa=True)  # Use Native Sparse Attention
-# model = create_quasar_model()  # Use Multi-Head Latent Attention
-# inputs = {"input_ids": torch.randint(0, 128000, (2, 512)), "attention_mask": torch.ones(2, 512)}
-# outputs = model(**inputs)

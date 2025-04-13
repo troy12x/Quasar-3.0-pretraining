@@ -47,7 +47,7 @@ class C4Dataset(Dataset):
         # Load C4 dataset from Hugging Face
         logger.info(f"Loading C4 dataset ({split} split)...")
         try:
-            self.dataset = load_dataset("eyad-silx/wiki-pretrain", "ab", split=split, cache_dir=cache_dir)
+            self.dataset = load_dataset("eyad-silx/wiki-pretrain", "all", split=split, cache_dir=cache_dir)
             logger.info(f"Loaded {len(self.dataset)} examples")
         except Exception as e:
             logger.warning(f"Failed to load C4 dataset: {e}")
@@ -189,7 +189,33 @@ def train(args, rank, world_size):
     
     # Create model
     logger.info("Creating Quasar model...")
-    model = create_quasar_model(use_nsa=args.use_nsa)
+    from tqdm import tqdm
+    import time
+    
+    # Show loading bar for model creation
+    with tqdm(total=100, desc="Creating Quasar model", ncols=100) as pbar:
+        # Initialization phase
+        pbar.update(5)
+        pbar.set_description("Initializing configuration")
+        time.sleep(0.1)
+        
+        # Create embeddings
+        pbar.update(10)
+        pbar.set_description("Creating token embeddings")
+        time.sleep(0.1)
+        
+        # Create model
+        model = create_quasar_model(use_nsa=args.use_nsa)
+        
+        # Calculate parameters
+        pbar.update(75)
+        pbar.set_description("Calculating parameter counts")
+        time.sleep(0.1)
+        
+        # Final setup
+        pbar.update(10)
+        pbar.set_description("Finalizing model setup")
+        time.sleep(0.1)
     
     # Enable gradient checkpointing if requested
     if args.gradient_checkpointing:
