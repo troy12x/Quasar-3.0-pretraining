@@ -305,7 +305,9 @@ class MultiHeadLatentAttention(nn.Module):
         # Apply attention dropout
         attention_probs = F.dropout(attention_probs, p=self.attention_dropout, training=self.training)
         
-        # Compute context vectors
+        # Compute context vectors - ensure matching dtype
+        # Convert attention_probs to v's dtype to avoid mismatch
+        attention_probs = attention_probs.to(dtype=v.dtype)
         context = torch.matmul(attention_probs, v)
         context = context.transpose(1, 2).contiguous()  # [batch, seq_length, num_heads, head_dim]
         

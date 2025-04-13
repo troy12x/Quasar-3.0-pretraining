@@ -566,8 +566,9 @@ def evaluate(model, dataloader, device, is_deepspeed=False):
     """Evaluate the model on the validation set."""
     model.eval()
     total_loss = 0.0
+    
     with torch.no_grad():
-        for batch in tqdm(dataloader, desc="Evaluating"):
+        for batch in dataloader:
             # Move batch to device (not needed for DeepSpeed)
             if not is_deepspeed:
                 batch = {k: v.to(device) for k, v in batch.items()}
@@ -577,13 +578,24 @@ def evaluate(model, dataloader, device, is_deepspeed=False):
                     if isinstance(v, torch.Tensor):
                         batch[k] = v.to(device)
             
-            # Forward pass
-            if is_deepspeed:
-                outputs = model(**batch)
-            else:
-                outputs = model(**batch)
-                
-            loss = outputs["loss"]
+            # Forward pass with proper dtype handling
+            try:
+                with torch.cuda.amp.autocast(enabled=True, dtype=torch.bfloat16):
+                    outputs = model(**batch)
+                    loss = outputs["loss"]
+            except RuntimeError as e:
+                # If we encounter a dtype error, try again with explicit casting
+                if "expected scalar type" in str(e):
+                    logger.warning("Dtype mismatch during evaluation, retrying with explicit casting")
+                    # Convert all inputs to the model's dtype
+                    model_dtype = next(model.parameters()).dtype
+                    batch = {k: v.to(dtype=model_dtype) if isinstance(v, torch.Tensor) else v 
+                            for k, v in batch.items()}
+                    outputs = model(**batch)
+                    loss = outputs["loss"]
+                else:
+                    # Re-raise if it's not a dtype error
+                    raise
             
             total_loss += loss.item()
     
