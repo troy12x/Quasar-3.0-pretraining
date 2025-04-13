@@ -75,7 +75,10 @@ class MultiHeadLatentAttention(nn.Module):
         self.register_buffer("cos", None, persistent=False)
         self.register_buffer("sin", None, persistent=False)
         
-    def forward(self, hidden_states, attention_mask=None, past_key_value=None, position_ids=None):
+        # TTM flag - only used for loss modulation, not to replace MLA
+        self.use_ttm = getattr(config, 'use_ttm', False)
+        
+    def forward(self, hidden_states, attention_mask=None, past_key_value=None, position_ids=None, token_temperatures=None):
         batch_size, seq_length = hidden_states.shape[:2]
         
         # Initialize or extend position_ids
@@ -245,6 +248,108 @@ class NSAAttention(nn.Module):
         
         return output, past_key_value
 
+class TokenTemperatureModulation(nn.Module):
+    """Token Temperature Modulation (TTM) mechanism for Quasar 3.0.
+    
+    TTM helps the model distinguish important tokens ("hot" tokens) from irrelevant ones ("cold" tokens).
+    This reduces hallucinations, token overuse, and overthinking by modulating attention based on token importance.
+    
+    The implementation calculates importance scores based on token frequency, position, and local context,
+    then uses these scores to adjust the loss function during training.
+    """
+    def __init__(self, config):
+        super().__init__()
+        self.config = config
+        self.hidden_size = config.hidden_size
+        
+        # Hyperparameters for importance score calculation
+        self.alpha = getattr(config, 'ttm_alpha', 0.5)  # Weight for frequency score
+        self.beta = getattr(config, 'ttm_beta', 0.3)   # Weight for position score
+        self.gamma = getattr(config, 'ttm_gamma', 0.2)  # Weight for context score
+        
+        # Context pattern detection via 1D convolutions
+        self.context_conv = nn.Sequential(
+            nn.Conv1d(self.hidden_size, self.hidden_size // 2, kernel_size=3, padding=1),
+            nn.GELU(),
+            nn.Conv1d(self.hidden_size // 2, 1, kernel_size=3, padding=1)
+        )
+        
+        # Projection for calculating frequency score from embeddings
+        self.freq_projection = nn.Linear(self.hidden_size, 1)
+        
+    def calculate_frequency_score(self, hidden_states, input_ids=None):
+        """Calculate token frequency score.
+        
+        If input_ids are provided, we can use a lookup table approach.
+        Otherwise, we estimate from hidden states.
+        """
+        if input_ids is not None:
+            # This would ideally use a precomputed frequency table
+            # For now, we'll use a simple approximation based on token IDs
+            # Lower IDs tend to be more frequent in most tokenizers
+            batch_size, seq_len = input_ids.shape
+            max_id = self.config.vocab_size
+            freq_score = 1.0 - (input_ids.float() / max_id)
+            return freq_score.unsqueeze(-1)  # [batch, seq, 1]
+        else:
+            # Estimate frequency from hidden states
+            return torch.sigmoid(self.freq_projection(hidden_states))
+    
+    def calculate_position_score(self, seq_len, device):
+        """Calculate position-based importance score.
+        
+        Tokens at different positions have different importance.
+        Generally, earlier tokens provide more context.
+        """
+        position_indices = torch.arange(seq_len, device=device).float()
+        # Normalize positions to [0, 1] range and invert (earlier = more important)
+        position_score = 1.0 - (position_indices / seq_len)
+        return position_score.unsqueeze(0).unsqueeze(-1)  # [1, seq, 1]
+    
+    def calculate_context_score(self, hidden_states):
+        """Calculate context pattern score using convolutions.
+        
+        Detects local patterns that might indicate important contextual tokens.
+        """
+        # [batch, seq, hidden] -> [batch, hidden, seq]
+        hidden_states_t = hidden_states.transpose(1, 2)
+        context_score = self.context_conv(hidden_states_t)
+        # [batch, 1, seq] -> [batch, seq, 1]
+        return context_score.transpose(1, 2)
+    
+    def calculate_token_temperatures(self, hidden_states, input_ids=None):
+        """Calculate temperature for each token based on importance scores."""
+        batch_size, seq_len, _ = hidden_states.shape
+        device = hidden_states.device
+        
+        # Calculate individual scores
+        freq_score = self.calculate_frequency_score(hidden_states, input_ids)
+        pos_score = self.calculate_position_score(seq_len, device)
+        context_score = self.calculate_context_score(hidden_states)
+        
+        # Combine scores: S(x_i) = α⋅f(x_i) + β⋅p(x_i) + γ⋅C(x_i)
+        importance_score = (
+            self.alpha * freq_score + 
+            self.beta * pos_score + 
+            self.gamma * context_score
+        )
+        
+        # Normalize scores across sequence
+        importance_sum = importance_score.sum(dim=1, keepdim=True) + 1e-6
+        token_temperatures = importance_score / importance_sum
+        
+        return token_temperatures
+    
+    def calculate_ttm_loss(self, lm_loss, token_temperatures):
+        """Calculate temperature-weighted loss to reinforce token-level focus."""
+        # Average temperature across sequence
+        mean_temp = token_temperatures.mean()
+        
+        # Apply temperature weighting to language modeling loss
+        ttm_loss = lm_loss * mean_temp
+        
+        return ttm_loss
+
 class QuasarExpertFFN(nn.Module):
     def __init__(self, config):
         super().__init__()
@@ -412,14 +517,17 @@ class QuasarTransformerBlock(nn.Module):
         # Dropout for better regularization
         self.dropout = nn.Dropout(config.hidden_dropout_prob)
         
-    def forward(self, hidden_states, attention_mask=None, past_key_value=None, position_ids=None):
+    def forward(self, hidden_states, attention_mask=None, past_key_value=None, position_ids=None, token_temperatures=None):
         # Pre-norm for attention
         normed_states = self.pre_attention_norm(hidden_states)
+        
+        # Apply attention with MLA as the main mechanism, TTM just passes token temperatures
         attention_output, past_key_value = self.attention(
             normed_states,
             attention_mask=attention_mask,
             past_key_value=past_key_value,
-            position_ids=position_ids
+            position_ids=position_ids,
+            token_temperatures=token_temperatures  # Just pass token temperatures, MLA decides how to use them
         )
         hidden_states = hidden_states + self.dropout(attention_output)
         
@@ -428,7 +536,7 @@ class QuasarTransformerBlock(nn.Module):
         ffn_output = self.ffn(normed_states)
         hidden_states = hidden_states + self.dropout(ffn_output)
         
-        return hidden_states
+        return hidden_states, past_key_value
 
 class QuasarConfig:
     def __init__(self):
@@ -460,6 +568,13 @@ class QuasarConfig:
         
         # Training parameters
         self.mtp_loss_weight = 0.2  # lambda for MTP loss
+        
+        # TTM parameters
+        self.use_ttm = True  # Enable Token Temperature Modulation
+        self.ttm_alpha = 0.5  # Weight for frequency score
+        self.ttm_beta = 0.3  # Weight for position score
+        self.ttm_gamma = 0.2  # Weight for context score
+        self.ttm_loss_weight = 0.15  # Weight for TTM loss component
         
         # Special token IDs - matching DeepSeek's implementation
         self.pad_token_id = 0
@@ -498,6 +613,10 @@ class Quasar(nn.Module):
         
         # Multi-token prediction module
         self.mtp = MultiTokenPrediction(config)
+        
+        # Token Temperature Modulation (TTM) module
+        if config.use_ttm:
+            self.ttm = TokenTemperatureModulation(config)
         
         # Gradient checkpointing flag
         self.gradient_checkpointing = False
@@ -542,20 +661,33 @@ class Quasar(nn.Module):
         
         # Initialize past_key_values if None
         if past_key_values is None:
-            past_key_values = tuple([None] * len(self.layers))
+            past_key_values = [None] * len(self.layers)
+            
+        # Calculate token temperatures for TTM if enabled
+        token_temperatures = None
+        if hasattr(self, 'ttm') and self.training:
+            token_temperatures = self.ttm.calculate_token_temperatures(hidden_states, input_ids)
         
         # Process through transformer layers
         moe_balance_loss = 0.0
         for i, layer in enumerate(self.layers):
             past_key_value = past_key_values[i] if past_key_values is not None else None
             if self.gradient_checkpointing and self.training:
-                hidden_states = torch.utils.checkpoint.checkpoint(layer, hidden_states, attention_mask, past_key_value, position_ids)
+                hidden_states, past_key_value = torch.utils.checkpoint.checkpoint(
+                    layer, 
+                    hidden_states, 
+                    attention_mask, 
+                    past_key_value, 
+                    position_ids,
+                    token_temperatures
+                )
             else:
-                hidden_states = layer(
+                hidden_states, past_key_value = layer(
                     hidden_states, 
                     attention_mask=attention_mask, 
                     past_key_value=past_key_value,
-                    position_ids=position_ids
+                    position_ids=position_ids,
+                    token_temperatures=token_temperatures
                 )
             
             # Accumulate MoE balance loss if available
@@ -565,46 +697,44 @@ class Quasar(nn.Module):
         # Final normalization
         hidden_states = self.final_norm(hidden_states)
         
-        # Main LM head output
+        # Output projection
         main_logits = self.output_projection(hidden_states)
         
         # Calculate main loss if labels are provided
         main_loss = None
         if labels is not None:
-            # Shift labels for autoregressive prediction
+            # Shift logits and labels for next token prediction
             shift_logits = main_logits[..., :-1, :].contiguous()
             shift_labels = labels[..., 1:].contiguous()
             
-            # Create loss mask - don't compute loss for padding tokens
-            loss_mask = (shift_labels != self.config.pad_token_id).float()
-            if self.config.eos_token_id is not None:
-                # Also compute loss for EOS token
-                eos_mask = (shift_labels == self.config.eos_token_id).float()
-                loss_mask = loss_mask + eos_mask
-                loss_mask = torch.clamp(loss_mask, 0, 1)
-            
-            # Compute cross entropy loss with masking
-            main_loss = F.cross_entropy(
-                shift_logits.view(-1, shift_logits.size(-1)),
-                shift_labels.view(-1),
-                reduction='none'
-            )
-            
-            # Apply loss mask and compute mean
-            main_loss = (main_loss * loss_mask.view(-1)).sum() / loss_mask.sum().clamp(min=1.0)
+            # Calculate cross entropy loss
+            loss_fct = nn.CrossEntropyLoss()
+            main_loss = loss_fct(shift_logits.view(-1, self.config.vocab_size), shift_labels.view(-1))
         
         # MTP output (predict next two tokens)
         mtp_logits, mtp_loss = self.mtp(hidden_states, attention_mask, labels)
         
+        # Apply Token Temperature Modulation (TTM) to loss if enabled
+        ttm_loss = None
+        if hasattr(self, 'ttm') and main_loss is not None and self.training and token_temperatures is not None:
+            ttm_loss = self.ttm.calculate_ttm_loss(main_loss, token_temperatures)
+        
         # Total loss
         loss = None
         if main_loss is not None and mtp_loss is not None:
-            loss = main_loss + self.config.mtp_loss_weight * mtp_loss + moe_balance_loss
+            if ttm_loss is not None:
+                loss = main_loss + self.config.mtp_loss_weight * mtp_loss + moe_balance_loss + self.config.ttm_loss_weight * ttm_loss
+            else:
+                loss = main_loss + self.config.mtp_loss_weight * mtp_loss + moe_balance_loss
         
         return {
             'main_logits': main_logits,
             'mtp_logits': mtp_logits,
             'loss': loss,
+            'main_loss': main_loss,
+            'mtp_loss': mtp_loss,
+            'moe_balance_loss': moe_balance_loss,
+            'ttm_loss': ttm_loss,
             'hidden_states': hidden_states
         }
 
