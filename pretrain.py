@@ -47,7 +47,7 @@ class C4Dataset(Dataset):
         # Load C4 dataset from Hugging Face
         logger.info(f"Loading C4 dataset ({split} split)...")
         try:
-            self.dataset = load_dataset("eyad-silx/wiki-pretrain", "all", split=split, cache_dir=cache_dir)
+            self.dataset = load_dataset("eyad-silx/wiki-pretrain", "ab", split=split, cache_dir=cache_dir)
             logger.info(f"Loaded {len(self.dataset)} examples")
         except Exception as e:
             logger.warning(f"Failed to load C4 dataset: {e}")
@@ -133,7 +133,9 @@ def train(args, rank, world_size):
         wandb.init(
             project="quasar-pretrain",
             config=vars(args),
-            name=args.run_name
+            name=args.run_name,
+            tags=["quasar3", f"bs{args.batch_size}", f"lr{args.learning_rate}", 
+                  f"precision-{args.precision}", "deepspeed" if args.deepspeed else "standard"]
         )
     
     # Load custom tokenizer from tokenizer.json
@@ -194,28 +196,14 @@ def train(args, rank, world_size):
     
     # Show loading bar for model creation
     with tqdm(total=100, desc="Creating Quasar model", ncols=100) as pbar:
-        # Initialization phase
-        pbar.update(5)
-        pbar.set_description("Initializing configuration")
-        time.sleep(0.1)
-        
-        # Create embeddings
         pbar.update(10)
-        pbar.set_description("Creating token embeddings")
-        time.sleep(0.1)
+        time.sleep(0.2)  # Simulate initialization
         
         # Create model
         model = create_quasar_model(use_nsa=args.use_nsa)
         
-        # Calculate parameters
-        pbar.update(75)
-        pbar.set_description("Calculating parameter counts")
-        time.sleep(0.1)
-        
-        # Final setup
-        pbar.update(10)
-        pbar.set_description("Finalizing model setup")
-        time.sleep(0.1)
+        pbar.update(90)
+        time.sleep(0.2)  # Simulate finalization
     
     # Enable gradient checkpointing if requested
     if args.gradient_checkpointing:
@@ -289,6 +277,29 @@ def train(args, rank, world_size):
                 },
                 "steps_per_print": args.logging_steps,
                 "wall_clock_breakdown": False
+            }
+        
+        # Modify DeepSpeed config to ensure proper warmup
+        if 'scheduler' not in ds_config or ds_config['scheduler'] is None:
+            ds_config['scheduler'] = {
+                'type': 'WarmupLR',
+                'params': {
+                    'warmup_min_lr': 0,
+                    'warmup_max_lr': args.learning_rate,
+                    'warmup_num_steps': args.warmup_steps
+                }
+            }
+        
+        # Make sure optimizer config is properly set
+        if 'optimizer' not in ds_config or ds_config['optimizer'] is None:
+            ds_config['optimizer'] = {
+                'type': 'AdamW',
+                'params': {
+                    'lr': args.learning_rate,
+                    'betas': [args.adam_beta1, args.adam_beta2],
+                    'eps': args.adam_epsilon,
+                    'weight_decay': args.weight_decay
+                }
             }
         
         # Move model to GPU before DeepSpeed initialization
@@ -372,6 +383,7 @@ def train(args, rank, world_size):
     else:
         scaler = torch.amp.GradScaler("cuda", enabled=False)
     
+    start_time = time.time()
     for epoch in range(start_epoch, args.num_epochs):
         model.train()
         epoch_loss = 0.0
@@ -461,12 +473,51 @@ def train(args, rank, world_size):
             
             # Log to wandb
             if rank == 0 and args.use_wandb and global_step % args.logging_steps == 0:
-                wandb.log({
-                    "train/loss": loss_value,
-                    "train/learning_rate": scheduler.get_last_lr()[0] if not args.deepspeed else model.get_lr()[0],
-                    "train/epoch": epoch + (progress_bar.n / len(progress_bar)),
-                    "train/global_step": global_step
-                })
+                # Get learning rate
+                if args.deepspeed:
+                    current_lr = model.get_lr()[0]
+                else:
+                    current_lr = scheduler.get_last_lr()[0]
+                
+                # Get MoE balance loss if available
+                moe_loss = 0.0
+                if hasattr(model, 'module'):
+                    if hasattr(model.module, 'moe_balance_loss'):
+                        moe_loss = model.module.moe_balance_loss
+                    elif hasattr(model.module, 'layers') and len(model.module.layers) > 0:
+                        # Try to get from the first layer that might have it
+                        for layer in model.module.layers:
+                            if hasattr(layer, 'ffn') and hasattr(layer.ffn, 'sequence_balance_loss'):
+                                moe_loss = layer.ffn.sequence_balance_loss
+                                break
+                
+                # Log detailed metrics
+                metrics = {
+                    "loss": loss_value,  # Use simpler keys for main metrics
+                    "learning_rate": current_lr,
+                    "epoch": epoch + (progress_bar.n / len(progress_bar)),
+                    "global_step": global_step,
+                    "train/samples_per_second": args.batch_size / (time.time() - start_time),
+                    "train/moe_balance_loss": moe_loss
+                }
+                
+                # Add GPU memory usage if available
+                try:
+                    if torch.cuda.is_available():
+                        metrics["system/gpu_memory_allocated"] = torch.cuda.memory_allocated() / (1024 ** 3)  # GB
+                        metrics["system/gpu_memory_reserved"] = torch.cuda.memory_reserved() / (1024 ** 3)  # GB
+                except:
+                    pass
+                
+                # Log metrics to wandb
+                wandb.log(metrics)
+                
+                # Also log to console for visibility
+                if rank == 0 and global_step % (args.logging_steps * 5) == 0:
+                    logger.info(f"Step {global_step}: loss={loss_value:.4f}, lr={current_lr:.6f}, moe_loss={moe_loss:.6f}")
+                
+                # Reset timer for samples per second calculation
+                start_time = time.time()
             
             # Save checkpoint
             if rank == 0 and global_step % args.save_steps == 0:
@@ -599,7 +650,7 @@ def main():
     parser.add_argument("--output_dir", type=str, default="./checkpoints", help="Output directory")
     parser.add_argument("--logging_steps", type=int, default=100, help="Logging steps")
     parser.add_argument("--save_steps", type=int, default=5000, help="Save steps")
-    parser.add_argument("--eval_steps", type=int, default=1000, help="Run evaluation every X updates steps")
+    parser.add_argument("--eval_steps", type=int, default=5000, help="Run evaluation every X updates steps")
     parser.add_argument("--run_name", type=str, default="quasar-pretrain", help="Run name for wandb")
     parser.add_argument("--use_wandb", action="store_true", help="Whether to use wandb")
     
