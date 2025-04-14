@@ -9,8 +9,9 @@ if __name__ == "__main__":
     parser.add_argument("--output_dir", type=str, default="./checkpoints", help="Output directory for checkpoints")
     parser.add_argument("--batch_size", type=int, default=4, help="Batch size per GPU")
     parser.add_argument("--num_epochs", type=int, default=1, help="Number of training epochs")
-    parser.add_argument("--learning_rate", type=float, default=3e-4, help="Learning rate")
-    parser.add_argument("--max_seq_length", type=int, default=2048, help="Maximum sequence length")
+    parser.add_argument("--learning_rate", type=float, default=4e-4, help="Peak learning rate")
+    parser.add_argument("--min_learning_rate", type=float, default=4e-5, help="Minimum learning rate for cosine schedule")
+    parser.add_argument("--max_seq_length", type=int, default=8129, help="Maximum sequence length")
     parser.add_argument("--use_wandb", action="store_true", help="Whether to use wandb for logging")
     parser.add_argument("--distributed", action="store_true", help="Whether to use distributed training")
     parser.add_argument("--tokenizer_path", type=str, default="./tokenizer.json", help="Path to tokenizer.json file")
@@ -61,6 +62,7 @@ if __name__ == "__main__":
           f"--batch_size {args.batch_size} " \
           f"--num_epochs {args.num_epochs} " \
           f"--learning_rate {args.learning_rate} " \
+          f"--min_learning_rate {args.min_learning_rate} " \
           f"--max_seq_length {args.max_seq_length} " \
           f"--tokenizer_path {args.tokenizer_path} " \
           f"--gradient_accumulation_steps {args.gradient_accumulation_steps} " \

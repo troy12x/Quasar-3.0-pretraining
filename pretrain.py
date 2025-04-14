@@ -39,6 +39,10 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+# Function to check if this is the main process
+def is_main_process(local_rank):
+    return local_rank in [-1, 0]
+
 class C4Dataset(Dataset):
     def __init__(self, tokenizer, split="train", max_length=8129, cache_dir=None):
         self.tokenizer = tokenizer
@@ -118,16 +122,22 @@ def get_parameter_count(model):
     return sum(p.numel() for p in model.parameters())
 
 def train(args, rank, world_size):
-    # Set up distributed training if needed
-    if args.distributed and not args.deepspeed:
-        setup_distributed(rank, world_size)
+    """Train the model."""
+    # Set device
+    if torch.cuda.is_available():
+        device = torch.device(f"cuda:{rank}")
+    else:
+        device = torch.device("cpu")
+    
+    # Only log from the main process
+    should_log = is_main_process(rank)
     
     # Set random seeds for reproducibility
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
     
     # Initialize wandb for tracking experiments
-    if rank == 0 and args.use_wandb:
+    if should_log and args.use_wandb:
         wandb.init(
             project="quasar-pretrain",
             config=vars(args),
@@ -137,7 +147,8 @@ def train(args, rank, world_size):
         )
     
     # Load custom tokenizer from tokenizer.json
-    logger.info(f"Loading tokenizer from {args.tokenizer_path}")
+    if should_log:
+        logger.info(f"Loading tokenizer from {args.tokenizer_path}")
     tokenizer = PreTrainedTokenizerFast(tokenizer_file=args.tokenizer_path)
     
     # Set special tokens
@@ -147,7 +158,6 @@ def train(args, rank, world_size):
     tokenizer.unk_token = "<｜▁unk▁｜>"
     
     # Create datasets and dataloaders
-    device = torch.device("cuda", rank) if torch.cuda.is_available() else torch.device("cpu")
     train_dataset = C4Dataset(
         tokenizer=tokenizer,
         split="train",
@@ -164,10 +174,12 @@ def train(args, rank, world_size):
             max_length=args.max_seq_length,
             cache_dir=args.cache_dir,
         )
-        logger.info(f"Loaded validation dataset with {len(val_dataset)} examples")
+        if should_log:
+            logger.info(f"Loaded validation dataset with {len(val_dataset)} examples")
     except Exception as e:
-        logger.warning(f"Validation dataset not available: {e}")
-        logger.info("Training will continue without validation")
+        if should_log:
+            logger.warning(f"Validation dataset not available: {e}")
+            logger.info("Training will continue without validation")
         val_dataset = None  # Ensure it's None even if partially initialized
     
     if args.distributed and not args.deepspeed:
@@ -199,7 +211,8 @@ def train(args, rank, world_size):
         )
     
     # Create model
-    logger.info("Creating Quasar model...")
+    if should_log:
+        logger.info("Creating Quasar model...")
     from tqdm import tqdm
     import time
     
@@ -216,12 +229,14 @@ def train(args, rank, world_size):
     
     # Enable gradient checkpointing if requested
     if args.gradient_checkpointing:
-        logger.info("Enabling gradient checkpointing to save memory")
+        if should_log:
+            logger.info("Enabling gradient checkpointing to save memory")
         model.gradient_checkpointing_enable()
     
     # Log parameter count
     param_count = get_parameter_count(model)
-    logger.info(f"Model created with {param_count/1e9:.2f}B parameters")
+    if should_log:
+        logger.info(f"Model created with {param_count/1e9:.2f}B parameters")
     
     # Setup optimizer parameters
     optimizer_params = {
@@ -240,14 +255,16 @@ def train(args, rank, world_size):
     
     # DeepSpeed integration
     if args.deepspeed and DEEPSPEED_AVAILABLE:
-        logger.info("Initializing DeepSpeed...")
+        if should_log:
+            logger.info("Initializing DeepSpeed...")
         # Load DeepSpeed config
         ds_config = None
         if os.path.exists(args.deepspeed_config):
             with open(args.deepspeed_config, 'r') as f:
                 ds_config = json.load(f)
         else:
-            logger.warning(f"DeepSpeed config file {args.deepspeed_config} not found. Using default config.")
+            if should_log:
+                logger.warning(f"DeepSpeed config file {args.deepspeed_config} not found. Using default config.")
             ds_config = {
                 "train_batch_size": int(args.batch_size * world_size * args.gradient_accumulation_steps),
                 "gradient_accumulation_steps": int(args.gradient_accumulation_steps),
@@ -349,7 +366,7 @@ def train(args, rank, world_size):
                 )
             scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
         elif args.lr_scheduler == "cosine":
-            scheduler = CosineAnnealingLR(optimizer, T_max=total_steps, eta_min=1e-6)
+            scheduler = CosineAnnealingLR(optimizer, T_max=total_steps, eta_min=args.min_learning_rate)
         elif args.lr_scheduler == "constant":
             scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lambda step: 1.0)
         elif args.lr_scheduler == "constant_with_warmup":
@@ -365,7 +382,8 @@ def train(args, rank, world_size):
     best_val_loss = float('inf')
     
     if args.resume_from_checkpoint and os.path.exists(args.resume_from_checkpoint):
-        logger.info(f"Loading checkpoint from {args.resume_from_checkpoint}")
+        if should_log:
+            logger.info(f"Loading checkpoint from {args.resume_from_checkpoint}")
         checkpoint = torch.load(args.resume_from_checkpoint, map_location=f"cuda:{rank}")
         
         # Load model weights
@@ -383,10 +401,12 @@ def train(args, rank, world_size):
         global_step = checkpoint["global_step"]
         best_val_loss = checkpoint.get("best_val_loss", float('inf'))
         
-        logger.info(f"Resuming from epoch {start_epoch} (global step {global_step})")
+        if should_log:
+            logger.info(f"Resuming from epoch {start_epoch} (global step {global_step})")
     
     # Training loop
-    logger.info("Starting training...")
+    if should_log:
+        logger.info("Starting training...")
     if args.precision in ["fp16", "bf16"] and not args.deepspeed:
         scaler = torch.amp.GradScaler("cuda", enabled=True)
     else:
@@ -481,7 +501,7 @@ def train(args, rank, world_size):
             progress_bar.set_postfix({"loss": loss_value, "lr": scheduler.get_last_lr()[0] if not args.deepspeed else model.get_lr()[0]})
             
             # Log to wandb
-            if rank == 0 and args.use_wandb and global_step % args.logging_steps == 0:
+            if should_log and args.use_wandb and global_step % args.logging_steps == 0:
                 # Get learning rate
                 if args.deepspeed:
                     current_lr = model.get_lr()[0]
@@ -522,14 +542,14 @@ def train(args, rank, world_size):
                 wandb.log(metrics)
                 
                 # Also log to console for visibility
-                if rank == 0 and global_step % (args.logging_steps * 1) == 0:
+                if should_log and global_step % (args.logging_steps * 1) == 0:
                     logger.info(f"Step {global_step}: loss={loss_value:.4f}, lr={current_lr:.6f}, moe_loss={moe_loss:.6f}")
                 
                 # Reset timer for samples per second calculation
                 start_time = time.time()
             
             # Save checkpoint
-            if rank == 0 and global_step % args.save_steps == 0:
+            if should_log and global_step % args.save_steps == 0:
                 if args.deepspeed:
                     # DeepSpeed handles saving checkpoints
                     model.save_checkpoint(args.output_dir, f"checkpoint-{global_step}")
@@ -538,15 +558,17 @@ def train(args, rank, world_size):
         
         # Calculate average epoch loss
         epoch_loss /= len(train_loader)
-        logger.info(f"Epoch {epoch+1}/{args.num_epochs} - Average Loss: {epoch_loss:.4f}")
+        if should_log:
+            logger.info(f"Epoch {epoch+1}/{args.num_epochs} - Average Loss: {epoch_loss:.4f}")
         
         # Validation
         if val_dataset is not None:
             val_loss = evaluate(model, val_loader, device, is_deepspeed=args.deepspeed)
-            logger.info(f"Epoch {epoch+1}/{args.num_epochs} - Validation Loss: {val_loss:.4f}")
+            if should_log:
+                logger.info(f"Epoch {epoch+1}/{args.num_epochs} - Validation Loss: {val_loss:.4f}")
         
             # Log validation metrics
-            if rank == 0 and args.use_wandb:
+            if should_log and args.use_wandb:
                 wandb.log({
                     "validation/loss": val_loss,
                     "validation/epoch": epoch + 1,
@@ -554,7 +576,7 @@ def train(args, rank, world_size):
                 })
         
             # Save best model
-            if rank == 0 and val_loss < best_val_loss:
+            if should_log and val_loss < best_val_loss:
                 best_val_loss = val_loss
                 save_checkpoint(
                     model, optimizer, scheduler, epoch, global_step, args,
@@ -562,7 +584,7 @@ def train(args, rank, world_size):
                 )
     
     # Save final model
-    if rank == 0:
+    if should_log:
         save_checkpoint(
             model, optimizer, scheduler, args.num_epochs-1, global_step, args,
             filename=f"final_model.pt"
@@ -644,6 +666,9 @@ def save_checkpoint(model, optimizer, scheduler, epoch, global_step, args, filen
 def main():
     parser = argparse.ArgumentParser(description="Pretrain Quasar model on C4 dataset")
     
+    # Add local_rank argument for distributed training
+    parser.add_argument("--local_rank", type=int, default=-1, help="Local rank for distributed training")
+    
     # Data arguments
     parser.add_argument("--tokenizer_path", type=str, default="./tokenizer.json", help="Path to tokenizer.json file")
     parser.add_argument("--max_seq_length", type=int, default=8129, help="Maximum sequence length")
@@ -652,7 +677,8 @@ def main():
     # Training arguments
     parser.add_argument("--batch_size", type=int, default=8, help="Batch size per GPU")
     parser.add_argument("--num_epochs", type=int, default=1, help="Number of training epochs")
-    parser.add_argument("--learning_rate", type=float, default=3e-4, help="Learning rate")
+    parser.add_argument("--learning_rate", type=float, default=4e-4, help="Peak learning rate")
+    parser.add_argument("--min_learning_rate", type=float, default=4e-5, help="Minimum learning rate for cosine schedule")
     parser.add_argument("--weight_decay", type=float, default=0.01, help="Weight decay")
     parser.add_argument("--warmup_ratio", type=float, default=0.01, help="Warmup ratio")
     parser.add_argument("--adam_beta1", type=float, default=0.9, help="Adam beta1")
