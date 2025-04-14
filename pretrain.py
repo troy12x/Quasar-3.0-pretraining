@@ -645,7 +645,7 @@ def main():
     
     # Data arguments
     parser.add_argument("--tokenizer_path", type=str, default="./tokenizer.json", help="Path to tokenizer.json file")
-    parser.add_argument("--max_seq_length", type=int, default=2048, help="Maximum sequence length")
+    parser.add_argument("--max_seq_length", type=int, default=8129, help="Maximum sequence length")
     parser.add_argument("--cache_dir", type=str, default=None, help="Directory to cache datasets")
     
     # Training arguments
