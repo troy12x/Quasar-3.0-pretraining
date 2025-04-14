@@ -48,7 +48,8 @@ class C4Dataset(Dataset):
         # Load C4 dataset from Hugging Face
         logger.info(f"Loading C4 dataset ({split} split)...")
         try:
-            self.dataset = load_dataset("eyad-silx/wiki-pretrain", "ar", split=split, cache_dir=cache_dir)
+            #for wiki "eyad-silx/wiki-pretrain", "ar",
+            self.dataset = load_dataset("Ashmal/Arabic_Pretraining_10K", split=split, cache_dir=cache_dir)
             logger.info(f"Loaded {len(self.dataset)} examples")
         except Exception as e:
             logger.warning(f"Failed to load C4 dataset: {e}")
