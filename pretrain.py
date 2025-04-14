@@ -53,13 +53,7 @@ class C4Dataset(Dataset):
         except Exception as e:
             logger.warning(f"Failed to load C4 dataset: {e}")
             logger.info("Falling back to a smaller dataset (wikitext)...")
-            try:
-                self.dataset = load_dataset("eyad-silx/wiki-pretrain", "ar", split=split, cache_dir=cache_dir)
-                logger.info(f"Loaded {len(self.dataset)} examples from wikitext")
-            except Exception as e2:
-                logger.error(f"Failed to load fallback dataset: {e2}")
-                # If we can't load the dataset, raise an exception to be caught by the caller
-                raise ValueError(f"Could not load dataset for split '{split}'")
+           
         
     def __len__(self):
         if self.dataset is None:
