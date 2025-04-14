@@ -40,7 +40,7 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 class C4Dataset(Dataset):
-    def __init__(self, tokenizer, split="train", max_length=2048, cache_dir=None):
+    def __init__(self, tokenizer, split="train", max_length=8129, cache_dir=None):
         self.tokenizer = tokenizer
         self.max_length = max_length
         
@@ -53,15 +53,10 @@ class C4Dataset(Dataset):
             logger.warning(f"Failed to load C4 dataset: {e}")
             logger.info("Falling back to a smaller dataset (wikitext)...")
             try:
-                self.dataset = load_dataset("wikitext", "wikitext-103-v1", split=split, cache_dir=cache_dir)
+                self.dataset = load_dataset("eyad-silx/wiki-pretrain", "ar", split=split, cache_dir=cache_dir)
                 logger.info(f"Loaded {len(self.dataset)} examples from wikitext")
             except Exception as e2:
                 logger.error(f"Failed to load fallback dataset: {e2}")
-                # Create a small dummy dataset for testing
-                logger.info("Using a dummy dataset for testing")
-                from datasets import Dataset as HFDataset
-                dummy_data = [{"text": "This is a dummy text for testing the Quasar model."} for _ in range(100)]
-                self.dataset = HFDataset.from_dict({"text": [item["text"] for item in dummy_data]})
         
     def __len__(self):
         return len(self.dataset)
