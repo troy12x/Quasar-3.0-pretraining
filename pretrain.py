@@ -43,6 +43,7 @@ class C4Dataset(Dataset):
     def __init__(self, tokenizer, split="train", max_length=8129, cache_dir=None):
         self.tokenizer = tokenizer
         self.max_length = max_length
+        self.dataset = None
         
         # Load C4 dataset from Hugging Face
         logger.info(f"Loading C4 dataset ({split} split)...")
@@ -57,12 +58,19 @@ class C4Dataset(Dataset):
                 logger.info(f"Loaded {len(self.dataset)} examples from wikitext")
             except Exception as e2:
                 logger.error(f"Failed to load fallback dataset: {e2}")
+                # If we can't load the dataset, raise an exception to be caught by the caller
+                raise ValueError(f"Could not load dataset for split '{split}'")
         
     def __len__(self):
+        if self.dataset is None:
+            return 0
         return len(self.dataset)
     
     def __getitem__(self, idx):
         # Handle different dataset formats (C4 vs Wikitext)
+        if self.dataset is None:
+            raise IndexError("Dataset is not loaded")
+            
         if "text" in self.dataset[idx]:
             text = self.dataset[idx]["text"]
         elif "page" in self.dataset[idx]:  # For Wikitext
@@ -152,16 +160,24 @@ def train(args, rank, world_size):
         cache_dir=args.cache_dir,
     )
     
-    val_dataset = C4Dataset(
-        tokenizer=tokenizer,
-        split="validation",
-        max_length=args.max_seq_length,
-        cache_dir=args.cache_dir,
-    )
+    # Try to load validation dataset, but continue without it if not available
+    val_dataset = None
+    try:
+        val_dataset = C4Dataset(
+            tokenizer=tokenizer,
+            split="validation",
+            max_length=args.max_seq_length,
+            cache_dir=args.cache_dir,
+        )
+        logger.info(f"Loaded validation dataset with {len(val_dataset)} examples")
+    except Exception as e:
+        logger.warning(f"Validation dataset not available: {e}")
+        logger.info("Training will continue without validation")
+        val_dataset = None  # Ensure it's None even if partially initialized
     
     if args.distributed and not args.deepspeed:
         train_sampler = DistributedSampler(train_dataset)
-        val_sampler = DistributedSampler(val_dataset, shuffle=False)
+        val_sampler = DistributedSampler(val_dataset, shuffle=False) if val_dataset else None
     else:
         train_sampler = None
         val_sampler = None
@@ -175,14 +191,17 @@ def train(args, rank, world_size):
         persistent_workers=True if args.num_workers > 0 else False
     )
     
-    val_loader = DataLoader(
-        val_dataset,
-        batch_size=args.batch_size,
-        sampler=val_sampler,
-        num_workers=args.num_workers,
-        pin_memory=True,
-        persistent_workers=True if args.num_workers > 0 else False
-    )
+    # Only create validation dataloader if validation dataset exists
+    val_loader = None
+    if val_dataset is not None and hasattr(val_dataset, 'dataset') and val_dataset.dataset is not None:
+        val_loader = DataLoader(
+            val_dataset,
+            batch_size=args.batch_size,
+            sampler=val_sampler,
+            num_workers=args.num_workers,
+            pin_memory=True,
+            persistent_workers=True if args.num_workers > 0 else False
+        )
     
     # Create model
     logger.info("Creating Quasar model...")
@@ -527,24 +546,25 @@ def train(args, rank, world_size):
         logger.info(f"Epoch {epoch+1}/{args.num_epochs} - Average Loss: {epoch_loss:.4f}")
         
         # Validation
-        val_loss = evaluate(model, val_loader, device, is_deepspeed=args.deepspeed)
-        logger.info(f"Epoch {epoch+1}/{args.num_epochs} - Validation Loss: {val_loss:.4f}")
+        if val_dataset is not None:
+            val_loss = evaluate(model, val_loader, device, is_deepspeed=args.deepspeed)
+            logger.info(f"Epoch {epoch+1}/{args.num_epochs} - Validation Loss: {val_loss:.4f}")
         
-        # Log validation metrics
-        if rank == 0 and args.use_wandb:
-            wandb.log({
-                "validation/loss": val_loss,
-                "validation/epoch": epoch + 1,
-                "validation/global_step": global_step
-            })
+            # Log validation metrics
+            if rank == 0 and args.use_wandb:
+                wandb.log({
+                    "validation/loss": val_loss,
+                    "validation/epoch": epoch + 1,
+                    "validation/global_step": global_step
+                })
         
-        # Save best model
-        if rank == 0 and val_loss < best_val_loss:
-            best_val_loss = val_loss
-            save_checkpoint(
-                model, optimizer, scheduler, epoch, global_step, args,
-                filename=f"best_model.pt"
-            )
+            # Save best model
+            if rank == 0 and val_loss < best_val_loss:
+                best_val_loss = val_loss
+                save_checkpoint(
+                    model, optimizer, scheduler, epoch, global_step, args,
+                    filename=f"best_model.pt"
+                )
     
     # Save final model
     if rank == 0:
@@ -655,7 +675,7 @@ def main():
     
     # Logging and saving arguments
     parser.add_argument("--output_dir", type=str, default="./checkpoints", help="Output directory")
-    parser.add_argument("--logging_steps", type=int, default=100, help="Logging steps")
+    parser.add_argument("--logging_steps", type=int, default=5, help="Logging steps")
     parser.add_argument("--save_steps", type=int, default=5000, help="Save steps")
     parser.add_argument("--eval_steps", type=int, default=5000, help="Run evaluation every X updates steps")
     parser.add_argument("--run_name", type=str, default="quasar-pretrain", help="Run name for wandb")
