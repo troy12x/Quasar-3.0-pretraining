@@ -61,13 +61,13 @@ class C4Dataset(Dataset):
         return len(self.dataset)
     
     def __getitem__(self, idx):
-        # Handle different dataset formats (C4 vs Wikitext)
+        # Handle different dataset formats 
         if self.dataset is None:
             raise IndexError("Dataset is not loaded")
             
         if "text" in self.dataset[idx]:
             text = self.dataset[idx]["text"]
-        elif "page" in self.dataset[idx]:  # For Wikitext
+        elif "page" in self.dataset[idx]:  
             text = self.dataset[idx]["page"]
         else:
             # Get the first field that contains text
@@ -662,7 +662,7 @@ def main():
     # Optimizer and scheduler arguments
     parser.add_argument("--optimizer", type=str, default="adamw", choices=["adamw", "adam", "sgd", "adafactor"],
                         help="Optimizer to use for training")
-    parser.add_argument("--warmup_steps", type=int, default=1000, help="Number of steps for linear warmup")
+    parser.add_argument("--warmup_steps", type=int, default=200, help="Number of steps for linear warmup")
     parser.add_argument("--lr_scheduler", type=str, default="cosine", 
                         choices=["linear", "cosine", "constant", "constant_with_warmup"],
                         help="Learning rate scheduler type")
