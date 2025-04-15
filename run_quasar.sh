@@ -23,7 +23,7 @@ else
 fi
 
 # Training parameters
-MICRO_BATCH_SIZE=2
+MICRO_BATCH_SIZE=4
 GRADIENT_ACCUMULATION_STEPS=4
 PRECISION="bf16"
 OUTPUT_DIR="./checkpoints"

@@ -721,16 +721,16 @@ class QuasarTransformerBlock(nn.Module):
 class QuasarConfig:
     def __init__(
         self,
-        vocab_size=128128,
-        hidden_size=1536,  # Reduced from 2048
-        num_hidden_layers=12,  # Reduced from 20
-        num_attention_heads=12,  # Reduced from 16
-        head_dim=128,
-        intermediate_size=4096,  # Reduced from 5632
-        kv_compressed_dim=192,  # Reduced from 256
-        query_compressed_dim=384,  # Reduced from 512
+        vocab_size=102400,  # DeepSeek
+        hidden_size=2048,   # DeepSeek (dim)
+        num_hidden_layers=27,  # DeepSeek (n_layers)
+        num_attention_heads=16,  # DeepSeek (n_heads)
+        head_dim=16,  # Keep as is unless you want v_head_dim=128
+        intermediate_size=20944,  # DeepSeek (inter_dim)
+        kv_compressed_dim=256,
+        query_compressed_dim=512,
         rope_dim_per_head=32,
-        max_position_embeddings=4096,
+        max_position_embeddings=8192,  # Keep as is
         attention_dropout_prob=0.0,
         hidden_dropout_prob=0.0,
         layer_norm_epsilon=1e-5,
@@ -741,19 +741,20 @@ class QuasarConfig:
         eos_token_id=2,
         tie_word_embeddings=True,
         use_moe=True,
-        num_experts=16,  # Reduced from 64
-        num_experts_per_token=4,
+        num_experts=66,  # 2 shared + 64 routed
+        num_experts_per_token=4,  # Keep as is
         moe_balance_loss_weight=0.01,
         first_layer_no_moe=True,
-        num_shared_experts=1,
-        num_routed_experts=16,  # Reduced from 64
-        top_k=4,
+        num_shared_experts=2,  # DeepSeek
+        num_routed_experts=64,  # DeepSeek
+        top_k=6,  # DeepSeek (n_activated_experts)
         load_balancing_alpha=0.01,
         load_balancing_gamma=0.01,
         use_ttm=True,
         ttm_loss_weight=0.01,
         mtp_loss_weight=0.1,
         use_mtp=True,
+        use_rope=True,
         use_nsa=False,
         **kwargs
     ):
@@ -968,14 +969,19 @@ class Quasar(nn.Module):
         }
 
 def create_quasar_model(use_nsa=False):
-    """Create a ~140B parameter Quasar model with ~32B active parameters through MoE."""
+    """Create a ~200B parameter Quasar model with ~17B active parameters through MoE."""
     config = QuasarConfig()
     config.use_nsa = use_nsa
     model = Quasar(config)
     
     # Calculate and print parameter count
     param_count = sum(p.numel() for p in model.parameters())
-    active_param_count = param_count / (config.num_routed_experts / config.top_k) if config.use_moe else param_count
+    
+    # Calculate active parameters more accurately
+    # For each token, we use all shared experts + top_k routed experts
+    shared_expert_params = param_count * (config.num_shared_experts / (config.num_shared_experts + config.num_routed_experts))
+    routed_expert_params = param_count * (config.num_routed_experts / (config.num_shared_experts + config.num_routed_experts))
+    active_param_count = shared_expert_params + (routed_expert_params * (config.top_k / config.num_routed_experts))
     
     print(f"Model created with {param_count/1e9:.2f}B total parameters")
     print(f"Approximately {active_param_count/1e9:.2f}B active parameters per token")

@@ -115,23 +115,19 @@ def main():
     logger.info("Creating Quasar model with compatible configuration")
     from quasar import QuasarConfig, Quasar
     
+    # Use the configuration directly from quasar.py
     config = QuasarConfig()
-    config.hidden_size = 1536
-    config.num_hidden_layers = 12
-    config.num_attention_heads = 12
-    config.intermediate_size = 4096
-    config.kv_compressed_dim = 192
-    config.query_compressed_dim = 384
-    config.num_experts = 16
-    config.num_shared_experts = 1
-    config.num_routed_experts = 16
-    config.top_k = 4
     config.use_nsa = False
     
     # Add any missing NSA parameters to avoid errors
     config.nsa_block_size = 64
     config.nsa_window_size = 256
     config.nsa_sparse_block_size = 32
+    
+    # Log the model configuration
+    logger.info(f"Using model configuration from QuasarConfig:")
+    logger.info(f"- Model size: {config.hidden_size} hidden size, {config.num_hidden_layers} layers")
+    logger.info(f"- MoE: {config.num_shared_experts} shared + {config.num_routed_experts} routed experts, top-{config.top_k}")
     
     model = Quasar(config)
     

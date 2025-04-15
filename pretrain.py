@@ -44,40 +44,84 @@ logger = logging.getLogger(__name__)
 def is_main_process(local_rank):
     return local_rank in [-1, 0]
 
-class C4Dataset(Dataset):
+class MultiDataset(Dataset):
     def __init__(self, tokenizer, split="train", max_length=8129, cache_dir=None):
         self.tokenizer = tokenizer
         self.max_length = max_length
-        self.dataset = None
+        self.datasets = []
+        self.dataset_sizes = []
+        self.total_size = 0
         
-        # Load C4 dataset from Hugging Face
-        logger.info(f"Loading C4 dataset ({split} split)...")
+        # 1. Load all subsets from eyad-silx/wiki-pretrain
+        logger.info(f"Loading wiki-pretrain datasets ({split} split)...")
+        wiki_subsets = ["ar", "en"]
+        for subset in wiki_subsets:
+            try:
+                dataset = load_dataset("eyad-silx/wiki-pretrain", subset, split=split, cache_dir=cache_dir)
+                self.datasets.append(dataset)
+                self.dataset_sizes.append(len(dataset))
+                self.total_size += len(dataset)
+                logger.info(f"Loaded wiki-pretrain/{subset} with {len(dataset)} examples")
+            except Exception as e:
+                logger.warning(f"Failed to load wiki-pretrain/{subset}: {e}")
+        
+        # 2. Load code pretraining data
+        logger.info(f"Loading code pretraining data ({split} split)...")
         try:
-            #for wiki "eyad-silx/wiki-pretrain", "ar",
-            self.dataset = load_dataset("Ashmal/Arabic_Pretraining_10K", split=split, cache_dir=cache_dir)
-            logger.info(f"Loaded {len(self.dataset)} examples")
+            code_dataset = load_dataset("ZhentingNLP/code_pretraining_data", split=split, cache_dir=cache_dir)
+            self.datasets.append(code_dataset)
+            self.dataset_sizes.append(len(code_dataset))
+            self.total_size += len(code_dataset)
+            logger.info(f"Loaded code_pretraining_data with {len(code_dataset)} examples")
         except Exception as e:
-            logger.warning(f"Failed to load C4 dataset: {e}")
-            logger.info("Falling back to a smaller dataset (wikitext)...")
-           
+            logger.warning(f"Failed to load code_pretraining_data: {e}")
         
+        # 3. Load Arabic pretraining data as backup
+        if not self.datasets:
+            logger.info(f"Loading Arabic pretraining data as backup ({split} split)...")
+            try:
+                arabic_dataset = load_dataset("Ashmal/Arabic_Pretraining_10K", split=split, cache_dir=cache_dir)
+                self.datasets.append(arabic_dataset)
+                self.dataset_sizes.append(len(arabic_dataset))
+                self.total_size += len(arabic_dataset)
+                logger.info(f"Loaded Arabic_Pretraining_10K with {len(arabic_dataset)} examples")
+            except Exception as e:
+                logger.warning(f"Failed to load Arabic_Pretraining_10K: {e}")
+        
+        # Check if we have any datasets loaded
+        if not self.datasets:
+            logger.error("Failed to load any datasets! Training will not work.")
+        else:
+            logger.info(f"Successfully loaded {len(self.datasets)} datasets with a total of {self.total_size} examples")
+    
     def __len__(self):
-        if self.dataset is None:
-            return 0
-        return len(self.dataset)
+        return self.total_size
     
     def __getitem__(self, idx):
-        # Handle different dataset formats 
-        if self.dataset is None:
-            raise IndexError("Dataset is not loaded")
-            
-        if "text" in self.dataset[idx]:
-            text = self.dataset[idx]["text"]
-        elif "page" in self.dataset[idx]:  
-            text = self.dataset[idx]["page"]
+        # Find which dataset this index belongs to
+        dataset_idx = 0
+        local_idx = idx
+        
+        while dataset_idx < len(self.dataset_sizes) and local_idx >= self.dataset_sizes[dataset_idx]:
+            local_idx -= self.dataset_sizes[dataset_idx]
+            dataset_idx += 1
+        
+        if dataset_idx >= len(self.datasets):
+            raise IndexError(f"Index {idx} out of range for combined dataset of size {self.total_size}")
+        
+        # Get the item from the appropriate dataset
+        item = self.datasets[dataset_idx][local_idx]
+        
+        # Extract text based on dataset format
+        if "text" in item:
+            text = item["text"]
+        elif "page" in item:
+            text = item["page"]
+        elif "content" in item:  # For code dataset
+            text = item["content"]
         else:
             # Get the first field that contains text
-            for key, value in self.dataset[idx].items():
+            for key, value in item.items():
                 if isinstance(value, str) and len(value) > 0:
                     text = value
                     break
@@ -163,27 +207,77 @@ def train(args, rank, world_size):
     tokenizer.unk_token = "<｜▁unk▁｜>"
     
     # Create datasets and dataloaders
-    train_dataset = C4Dataset(
+    train_dataset = MultiDataset(
         tokenizer=tokenizer,
         split="train",
         max_length=args.max_seq_length,
         cache_dir=args.cache_dir,
     )
     
-    # Try to load validation dataset, but continue without it if not available
+    # Load a specific validation dataset
     val_dataset = None
     try:
-        val_dataset = C4Dataset(
+        if should_log:
+            logger.info("Loading specific validation dataset: Jackmin108/c4-en-validation-mini")
+        # Create a simple validation dataset class that only loads the validation data
+        class ValidationDataset(Dataset):
+            def __init__(self, tokenizer, max_length=8129, cache_dir=None):
+                self.tokenizer = tokenizer
+                self.max_length = max_length
+                # Load the specific validation dataset
+                self.dataset = load_dataset("Jackmin108/c4-en-validation-mini", split="validation", cache_dir=cache_dir)
+                logger.info(f"Loaded validation dataset with {len(self.dataset)} examples")
+                
+            def __len__(self):
+                return len(self.dataset)
+                
+            def __getitem__(self, idx):
+                # Get text from the validation dataset
+                if "text" in self.dataset[idx]:
+                    text = self.dataset[idx]["text"]
+                else:
+                    # Fallback for other field names
+                    for key, value in self.dataset[idx].items():
+                        if isinstance(value, str) and len(value) > 0:
+                            text = value
+                            break
+                    else:
+                        text = "Validation example."
+                
+                # Tokenize text
+                encodings = self.tokenizer(
+                    text,
+                    max_length=self.max_length,
+                    truncation=True,
+                    padding="max_length",
+                    return_tensors="pt"
+                )
+                
+                input_ids = encodings["input_ids"].squeeze()
+                attention_mask = encodings["attention_mask"].squeeze()
+                
+                # Create labels (shifted input_ids for causal language modeling)
+                labels = input_ids.clone()
+                # Mask out padding tokens in labels
+                labels[labels == self.tokenizer.pad_token_id] = -100
+                
+                return {
+                    "input_ids": input_ids,
+                    "attention_mask": attention_mask,
+                    "labels": labels
+                }
+        
+        # Create the validation dataset
+        val_dataset = ValidationDataset(
             tokenizer=tokenizer,
-            split="validation",
             max_length=args.max_seq_length,
             cache_dir=args.cache_dir,
         )
         if should_log:
-            logger.info(f"Loaded validation dataset with {len(val_dataset)} examples")
+            logger.info(f"Successfully loaded validation dataset with {len(val_dataset)} examples")
     except Exception as e:
         if should_log:
-            logger.warning(f"Validation dataset not available: {e}")
+            logger.warning(f"Failed to load validation dataset: {e}")
             logger.info("Training will continue without validation")
         val_dataset = None  # Ensure it's None even if partially initialized
     

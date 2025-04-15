@@ -3,24 +3,34 @@ Parameter count calculator for Quasar model.
 This script calculates the theoretical parameter counts without instantiating the model.
 """
 
+# Import the configuration directly from quasar.py
+from quasar import QuasarConfig
+
 def calculate_quasar_parameters():
-    """Calculate the parameter counts for the 140B Quasar model with 32B active parameters."""
-    # Model configuration (copied from QuasarConfig)
+    """Calculate the parameter counts for the Quasar model using the current configuration."""
+    # Get the current model configuration from QuasarConfig
+    config_obj = QuasarConfig()
+    
+    # Convert to dictionary for easier access
     config = {
-        "vocab_size": 128000,
-        "hidden_size": 4096,
-        "num_hidden_layers": 32,
-        "num_attention_heads": 32,
-        "head_dim": 128,
-        "kv_compressed_dim": 512,
-        "query_compressed_dim": 1024,
-        "intermediate_size": 4096,
-        "num_shared_experts": 1,
-        "num_routed_experts": 128,
-        "top_k": 4,
-        "use_moe": True,
-        "first_layer_no_moe": True
+        "vocab_size": config_obj.vocab_size,
+        "hidden_size": config_obj.hidden_size,
+        "num_hidden_layers": config_obj.num_hidden_layers,
+        "num_attention_heads": config_obj.num_attention_heads,
+        "head_dim": config_obj.head_dim,
+        "kv_compressed_dim": config_obj.kv_compressed_dim,
+        "query_compressed_dim": config_obj.query_compressed_dim,
+        "intermediate_size": config_obj.intermediate_size,
+        "num_shared_experts": config_obj.num_shared_experts,
+        "num_routed_experts": config_obj.num_routed_experts,
+        "top_k": config_obj.top_k,
+        "use_moe": config_obj.use_moe,
+        "first_layer_no_moe": config_obj.first_layer_no_moe
     }
+    
+    print(f"Using configuration from QuasarConfig:")
+    print(f"- Model size: {config['hidden_size']} hidden size, {config['num_hidden_layers']} layers")
+    print(f"- MoE: {config['num_shared_experts']} shared + {config['num_routed_experts']} routed experts, top-{config['top_k']}")
     
     # Parameter count for each component
     params = {}
