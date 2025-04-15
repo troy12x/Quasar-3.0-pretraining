@@ -27,6 +27,7 @@ mp.set_start_method('spawn', force=True)
 try:
     import deepspeed
     from deepspeed.ops.adam import DeepSpeedCPUAdam, FusedAdam
+    from deepspeed.utils.zero_to_fp32 import get_fp32_state_dict_from_zero_checkpoint
     DEEPSPEED_AVAILABLE = True
 except ImportError:
     DEEPSPEED_AVAILABLE = False
@@ -138,13 +139,17 @@ def train(args, rank, world_size):
     
     # Initialize wandb for tracking experiments
     if should_log and args.use_wandb:
-        wandb.init(
-            project="quasar-pretrain",
-            config=vars(args),
-            name=args.run_name,
-            tags=["quasar3", f"bs{args.batch_size}", f"lr{args.learning_rate}", 
-                  f"precision-{args.precision}", "deepspeed" if args.deepspeed else "standard"]
-        )
+        # Only initialize wandb on the main process (rank 0)
+        if int(os.environ.get("LOCAL_RANK", "-1")) != 0:
+            os.environ["WANDB_MODE"] = "disabled"
+        else:
+            wandb.init(
+                project="quasar-pretrain",
+                config=vars(args),
+                name=args.run_name,
+                tags=["quasar3", f"bs{args.batch_size}", f"lr{args.learning_rate}", 
+                      f"precision-{args.precision}", "deepspeed" if args.deepspeed else "standard"]
+            )
     
     # Load custom tokenizer from tokenizer.json
     if should_log:
@@ -182,6 +187,7 @@ def train(args, rank, world_size):
             logger.info("Training will continue without validation")
         val_dataset = None  # Ensure it's None even if partially initialized
     
+    # Setup samplers for distributed training
     if args.distributed and not args.deepspeed:
         train_sampler = DistributedSampler(train_dataset)
         val_sampler = DistributedSampler(val_dataset, shuffle=False) if val_dataset else None
@@ -256,18 +262,33 @@ def train(args, rank, world_size):
     # DeepSpeed integration
     if args.deepspeed and DEEPSPEED_AVAILABLE:
         if should_log:
-            logger.info("Initializing DeepSpeed...")
+            logger.info("Initializing DeepSpeed for data parallel training...")
+            
+            # Log GPU information
+            gpu_count = torch.cuda.device_count()
+            logger.info(f"Found {gpu_count} GPUs for training")
+            for i in range(gpu_count):
+                logger.info(f"GPU {i}: {torch.cuda.get_device_name(i)}")
+            
         # Load DeepSpeed config
         ds_config = None
         if os.path.exists(args.deepspeed_config):
             with open(args.deepspeed_config, 'r') as f:
                 ds_config = json.load(f)
+                if should_log:
+                    logger.info(f"Loaded DeepSpeed config from {args.deepspeed_config}")
         else:
             if should_log:
                 logger.warning(f"DeepSpeed config file {args.deepspeed_config} not found. Using default config.")
+            # Calculate batch sizes properly to avoid DeepSpeed assertion errors
+            micro_batch = args.batch_size
+            grad_accum = args.gradient_accumulation_steps
+            train_batch = micro_batch * grad_accum * world_size
+            
             ds_config = {
-                "train_batch_size": int(args.batch_size * world_size * args.gradient_accumulation_steps),
-                "gradient_accumulation_steps": int(args.gradient_accumulation_steps),
+                "train_batch_size": train_batch,
+                "train_micro_batch_size_per_gpu": micro_batch,
+                "gradient_accumulation_steps": grad_accum,
                 "optimizer": {
                     "type": args.optimizer.capitalize(),
                     "params": optimizer_params
@@ -288,22 +309,31 @@ def train(args, rank, world_size):
                     }
                 },
                 "zero_optimization": {
-                    "stage": 3,
+                    "stage": 2,  # Using stage 2 for better balance of memory and performance
                     "offload_optimizer": {
-                        "device": "cpu"
-                    },
-                    "offload_param": {
                         "device": "cpu"
                     },
                     "overlap_comm": True,
                     "contiguous_gradients": True,
-                    "reduce_bucket_size": 5e8,
-                    "stage3_prefetch_bucket_size": 5e8,
-                    "stage3_param_persistence_threshold": 1e6
+                    "reduce_bucket_size": 5e8
                 },
                 "steps_per_print": args.logging_steps,
                 "wall_clock_breakdown": False
             }
+        
+        # Ensure DeepSpeed config has proper data parallelism settings
+        if "data_parallel_size" not in ds_config:
+            ds_config["data_parallel_size"] = world_size
+        
+        # Ensure proper precision settings
+        if args.precision == "bf16":
+            ds_config["bf16"] = {"enabled": True}
+            if "fp16" in ds_config:
+                ds_config["fp16"]["enabled"] = False
+        elif args.precision == "fp16":
+            ds_config["fp16"] = {"enabled": True}
+            if "bf16" in ds_config:
+                ds_config["bf16"]["enabled"] = False
         
         # Modify DeepSpeed config to ensure proper warmup
         if 'scheduler' not in ds_config or ds_config['scheduler'] is None:
@@ -339,6 +369,10 @@ def train(args, rank, world_size):
             config=ds_config,
             dist_init_required=True
         )
+        
+        if should_log:
+            logger.info(f"DeepSpeed initialized with config: {json.dumps(ds_config, indent=2)}")
+            logger.info(f"All {world_size} GPUs will work on the same task using data parallelism")
     else:
         # Standard training setup (non-DeepSpeed)
         # Move model to GPU and setup DDP if needed
@@ -549,12 +583,32 @@ def train(args, rank, world_size):
                 start_time = time.time()
             
             # Save checkpoint
-            if should_log and global_step % args.save_steps == 0:
+            if global_step % args.save_steps == 0:
                 if args.deepspeed:
                     # DeepSpeed handles saving checkpoints
-                    model.save_checkpoint(args.output_dir, f"checkpoint-{global_step}")
+                    try:
+                        # Only log from rank 0 but all ranks save
+                        checkpoint_path = os.path.join(args.output_dir, f"checkpoint-{global_step}")
+                        if should_log:
+                            logger.info(f"Saving DeepSpeed checkpoint to {checkpoint_path}")
+                        
+                        # Use simpler checkpoint saving to avoid NCCL issues
+                        client_state = {"checkpoint_step": global_step, "epoch": epoch}
+                        success = model.save_checkpoint(args.output_dir, f"checkpoint-{global_step}", client_state=client_state)
+                        
+                        # Only log from rank 0
+                        if should_log:
+                            if success:
+                                logger.info(f"Successfully saved checkpoint at step {global_step}")
+                            else:
+                                logger.warning(f"Failed to save checkpoint at step {global_step}")
+                    except Exception as e:
+                        if should_log:
+                            logger.warning(f"Error saving DeepSpeed checkpoint: {e}")
+                            logger.info("Continuing training despite checkpoint error")
                 else:
-                    save_checkpoint(model, optimizer, scheduler, epoch, global_step, args)
+                    if should_log:
+                        save_checkpoint(model, optimizer, scheduler, epoch, global_step, args)
         
         # Calculate average epoch loss
         epoch_loss /= len(train_loader)
@@ -713,7 +767,7 @@ def main():
     parser.add_argument("--gradient_checkpointing", action="store_true", help="Enable gradient checkpointing to save memory")
     parser.add_argument("--gradient_accumulation_steps", type=int, default=1, help="Number of steps to accumulate gradients")
     parser.add_argument("--precision", type=str, default="bf16", choices=["fp32", "fp16", "bf16", "fp8"], help="Precision for training")
-    parser.add_argument("--deepspeed", action="store_true", help="Enable DeepSpeed for model parallelism")
+    parser.add_argument("--deepspeed", action="store_true", help="Enable DeepSpeed for data parallel training")
     parser.add_argument("--deepspeed_config", type=str, default="deepspeed_config.json", help="DeepSpeed configuration file")
     parser.add_argument("--resume_from_checkpoint", type=str, default=None, help="Resume training from checkpoint")
     
@@ -730,8 +784,47 @@ def main():
     # Launch training
     if args.deepspeed and DEEPSPEED_AVAILABLE:
         # DeepSpeed handles distributed training internally
-        logger.info("Using DeepSpeed for distributed training")
-        train(args, 0, args.world_size)
+        # Set environment variables for DeepSpeed
+        if "MASTER_ADDR" not in os.environ:
+            os.environ["MASTER_ADDR"] = "localhost"
+        if "MASTER_PORT" not in os.environ:
+            os.environ["MASTER_PORT"] = "12355"
+            
+        # Get local rank from environment or args
+        local_rank = int(os.environ.get("LOCAL_RANK", args.local_rank))
+        if local_rank == -1:
+            local_rank = 0
+            
+        # Set required environment variables for distributed training if not already set
+        if "RANK" not in os.environ:
+            os.environ["RANK"] = str(local_rank)
+        if "WORLD_SIZE" not in os.environ:
+            os.environ["WORLD_SIZE"] = str(args.world_size)
+            
+        # Log DeepSpeed configuration
+        logger.info(f"Using DeepSpeed for data parallel training across {args.world_size} GPUs")
+        logger.info(f"Local rank: {local_rank}, World size: {args.world_size}")
+        logger.info(f"Environment variables: RANK={os.environ.get('RANK')}, WORLD_SIZE={os.environ.get('WORLD_SIZE')}, MASTER_ADDR={os.environ.get('MASTER_ADDR')}, MASTER_PORT={os.environ.get('MASTER_PORT')}")
+        
+        # Initialize distributed environment if not already done
+        if not torch.distributed.is_initialized():
+            try:
+                torch.distributed.init_process_group(backend="nccl")
+                logger.info("Successfully initialized process group with NCCL backend")
+            except Exception as e:
+                logger.warning(f"Failed to initialize with NCCL, trying Gloo backend: {e}")
+                try:
+                    # Fall back to Gloo backend which has better compatibility
+                    torch.distributed.init_process_group(backend="gloo")
+                    logger.info("Successfully initialized process group with Gloo backend")
+                except Exception as e:
+                    logger.error(f"Failed to initialize distributed environment: {e}")
+                    logger.info("Falling back to non-distributed training")
+                    train(args, 0, 1)
+                    return
+            
+        # Train with DeepSpeed
+        train(args, local_rank, args.world_size)
     elif args.distributed:
         logger.info(f"Using distributed training with {args.world_size} GPUs")
         mp.spawn(train, args=(args, args.world_size), nprocs=args.world_size, join=True)
