@@ -697,7 +697,7 @@ def main():
     # Logging and saving arguments
     parser.add_argument("--output_dir", type=str, default="./checkpoints", help="Output directory")
     parser.add_argument("--logging_steps", type=int, default=5, help="Logging steps")
-    parser.add_argument("--save_steps", type=int, default=5000, help="Save steps")
+    parser.add_argument("--save_steps", type=int, default=1000, help="Save steps")
     parser.add_argument("--eval_steps", type=int, default=5000, help="Run evaluation every X updates steps")
     parser.add_argument("--run_name", type=str, default="quasar-pretrain", help="Run name for wandb")
     parser.add_argument("--use_wandb", action="store_true", help="Whether to use wandb")
