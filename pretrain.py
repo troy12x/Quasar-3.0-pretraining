@@ -316,16 +316,31 @@ def train(args, rank, world_size):
     from tqdm import tqdm
     import time
     
-    # Show loading bar for model creation
-    with tqdm(total=100, desc="Creating Quasar model", ncols=100) as pbar:
-        pbar.update(10)
-        time.sleep(0.2)  # Simulate initialization
+    # Show loading bar for model creation with time estimation
+    start_time = time.time()
+    
+    # Estimate total time based on model size (rough estimate)
+    hidden_size = QuasarConfig().hidden_size
+    num_layers = QuasarConfig().num_hidden_layers
+    num_experts = QuasarConfig().num_routed_experts + QuasarConfig().num_shared_experts
+    
+    # Rough time estimate in seconds based on model size
+    estimated_time = (hidden_size * num_layers * num_experts) / 1000000
+    
+    with tqdm(total=100, desc="Creating Quasar model", ncols=100, 
+              bar_format='{l_bar}{bar}| {n:.0f}/{total:.0f} [{elapsed}<{remaining}, {rate_fmt}]') as pbar:
         
-        # Create model
-        model = create_quasar_model(use_nsa=args.use_nsa)
+        # Create model with progress tracking
+        model = create_quasar_model(use_nsa=args.use_nsa, pbar=pbar)
         
-        pbar.update(90)
-        time.sleep(0.2)  # Simulate finalization
+        # Ensure we reach 100%
+        if pbar.n < 100:
+            pbar.update(100 - pbar.n)
+    
+    # Log the actual time taken
+    creation_time = time.time() - start_time
+    if should_log:
+        logger.info(f"Model creation completed in {creation_time:.2f} seconds")
     
     # Enable gradient checkpointing if requested
     if args.gradient_checkpointing:

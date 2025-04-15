@@ -1,4 +1,5 @@
 import math
+import time
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -798,9 +799,13 @@ class QuasarConfig:
             setattr(self, key, value)
 
 class Quasar(nn.Module):
-    def __init__(self, config):
+    def __init__(self, config, pbar=None):
         super().__init__()
         self.config = config
+        
+        if pbar:
+            pbar.update(5)
+            pbar.set_description("Creating token embeddings")
         
         # Token embeddings
         self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size)
@@ -810,13 +815,26 @@ class Quasar(nn.Module):
         
         # Main transformer layers
         self.layers = nn.ModuleList([])
-        for i in range(config.num_hidden_layers):
+        total_layers = config.num_hidden_layers
+        
+        # This is the most time-consuming part, so we track progress here
+        for i in range(total_layers):
+            if pbar:
+                # Update progress proportionally (70% of total progress)
+                progress_per_layer = 70.0 / total_layers
+                pbar.update(progress_per_layer)
+                pbar.set_description(f"Creating transformer layer {i+1}/{total_layers}")
+            
             layer = QuasarTransformerBlock(config, layer_idx=i)
             self.layers.append(layer)
         
         # Final layer norm
         self.final_norm = RMSNorm(config.hidden_size)
         
+        if pbar:
+            pbar.update(5)
+            pbar.set_description("Creating output projection")
+            
         # Output projection
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
         self.lm_head.weight = self.embed_tokens.weight  # Weight tying
@@ -968,13 +986,26 @@ class Quasar(nn.Module):
             'past_key_values': tuple(new_past_key_values) if new_past_key_values else None
         }
 
-def create_quasar_model(use_nsa=False):
+def create_quasar_model(use_nsa=False, pbar=None):
     """Create a ~200B parameter Quasar model with ~17B active parameters through MoE."""
+    # Start timing for more accurate progress estimation
+    start_time = time.time()
+    
+    if pbar:
+        pbar.update(5)
+        pbar.set_description("Initializing model configuration")
+    
     config = QuasarConfig()
     config.use_nsa = use_nsa
-    model = Quasar(config)
+    
+    # Create model with progress tracking
+    model = Quasar(config, pbar=pbar)
     
     # Calculate and print parameter count
+    if pbar:
+        pbar.update(5)
+        pbar.set_description("Calculating parameter counts")
+        
     param_count = sum(p.numel() for p in model.parameters())
     
     # Calculate active parameters more accurately
@@ -982,6 +1013,13 @@ def create_quasar_model(use_nsa=False):
     shared_expert_params = param_count * (config.num_shared_experts / (config.num_shared_experts + config.num_routed_experts))
     routed_expert_params = param_count * (config.num_routed_experts / (config.num_shared_experts + config.num_routed_experts))
     active_param_count = shared_expert_params + (routed_expert_params * (config.top_k / config.num_routed_experts))
+    
+    if pbar:
+        # Ensure we reach 100%
+        remaining = max(0, 100 - pbar.n)
+        if remaining > 0:
+            pbar.update(remaining)
+        pbar.set_description("Model creation complete")
     
     print(f"Model created with {param_count/1e9:.2f}B total parameters")
     print(f"Approximately {active_param_count/1e9:.2f}B active parameters per token")
