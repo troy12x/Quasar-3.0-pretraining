@@ -35,7 +35,11 @@ def generate_text(model, tokenizer, prompt, max_length=100, temperature=0.7, top
             outputs = model(input_ids=input_ids, attention_mask=attention_mask)
             
             # Get logits from the output dictionary
-            logits = outputs["main_logits"]
+            if isinstance(outputs, dict) and "main_logits" in outputs:
+                logits = outputs["main_logits"]
+            else:
+                # Handle different output formats
+                logits = outputs.logits if hasattr(outputs, "logits") else outputs
             
             # Get the logits for the last token
             next_token_logits = logits[0, -1, :]
@@ -97,7 +101,7 @@ def main():
     parser = argparse.ArgumentParser(description="Generate text with Quasar model checkpoint")
     parser.add_argument("--checkpoint_path", type=str, required=True, help="Path to the checkpoint directory")
     parser.add_argument("--tokenizer_path", type=str, default="./tokenizer.json", help="Path to tokenizer.json file")
-    parser.add_argument("--prompt", type=str, default="Аԥсуа бызшәа", help="Prompt for text generation")
+    parser.add_argument("--prompt", type=str, default="تسوق عامل", help="Prompt for text generation")
     parser.add_argument("--max_length", type=int, default=100, help="Maximum length of generated text")
     parser.add_argument("--temperature", type=float, default=0.8, help="Temperature for sampling")
     parser.add_argument("--top_p", type=float, default=0.95, help="Top-p for nucleus sampling")
@@ -116,8 +120,8 @@ def main():
     config.num_hidden_layers = 12
     config.num_attention_heads = 12
     config.intermediate_size = 4096
-    config.kv_dim = 192
-    config.query_dim = 384
+    config.kv_compressed_dim = 192
+    config.query_compressed_dim = 384
     config.num_experts = 16
     config.num_shared_experts = 1
     config.num_routed_experts = 16
@@ -170,15 +174,15 @@ def main():
     
     # Print the generated text
     print("\n" + "="*50)
-    print("GENERATED TEXT:")
+    print("GENERATED TEXT:")  
     print(generated_text)
     print("="*50 + "\n")
     
-    # Also try the Abkhaz prompts if not already specified
-    abkhaz_prompts = ["Аԥсуа бызшәа", "Аԥсны ҳәынҭқарра"]
-    for prompt in abkhaz_prompts:
+    # Also try additional Arabic prompts if not already specified
+    arabic_prompts = ["تسوق عامل", "الرقبة ترطيب"]
+    for prompt in arabic_prompts:
         if prompt != args.prompt:
-            logger.info(f"Generating text for additional Abkhaz prompt: {prompt}")
+            logger.info(f"Generating text for additional Arabic prompt: {prompt}")
             generated_text = generate_text(
                 model_engine,
                 tokenizer,
