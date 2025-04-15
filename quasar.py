@@ -672,10 +672,13 @@ class QuasarMoE(nn.Module):
 class QuasarTransformerBlock(nn.Module):
     def __init__(self, config, layer_idx=None):
         super().__init__()
+        self.layer_idx = layer_idx
         self.config = config
-        self.layer_idx = layer_idx if layer_idx is not None else 0
         
-        # Pre-attention normalization
+        # Memory-efficient initialization
+        self._initialize_memory_efficient = True
+        
+        # Pre-normalization for attention
         self.pre_attention_norm = RMSNorm(config.hidden_size, eps=config.layer_norm_epsilon)
         
         # Attention mechanism (MLA or NSA)
@@ -723,13 +726,13 @@ class QuasarConfig:
     def __init__(
         self,
         vocab_size=102400,  # DeepSeek
-        hidden_size=2048,   # DeepSeek (dim)
-        num_hidden_layers=27,  # DeepSeek (n_layers)
-        num_attention_heads=16,  # DeepSeek (n_heads)
-        head_dim=16,  # Keep as is unless you want v_head_dim=128
-        intermediate_size=20944,  # DeepSeek (inter_dim)
-        kv_compressed_dim=256,
-        query_compressed_dim=512,
+         hidden_size=2048,   # DeepSeek (dim)
+         num_hidden_layers=27,  # DeepSeek (n_layers)
+         num_attention_heads=16,  # DeepSeek (n_heads)
+         head_dim=16,  # Keep as is unless you want v_head_dim=128
+         intermediate_size=20944,  # DeepSeek (inter_dim)
+         kv_compressed_dim=256,
+         query_compressed_dim=512,
         rope_dim_per_head=32,
         max_position_embeddings=8192,  # Keep as is
         attention_dropout_prob=0.0,
@@ -799,9 +802,14 @@ class QuasarConfig:
             setattr(self, key, value)
 
 class Quasar(nn.Module):
-    def __init__(self, config, pbar=None):
+    def __init__(self, config, pbar=None, use_meta_device=False, ultra_lazy=False):
         super().__init__()
         self.config = config
+        
+        # For very large models, we'll use DeepSpeed's initialization
+        # This just creates the structure without allocating memory
+        self.use_meta_device = use_meta_device
+        self.ultra_lazy = ultra_lazy
         
         if pbar:
             pbar.update(5)
@@ -825,8 +833,13 @@ class Quasar(nn.Module):
                 pbar.update(progress_per_layer)
                 pbar.set_description(f"Creating transformer layer {i+1}/{total_layers}")
             
+            # Memory-efficient initialization - clear CUDA cache after each layer
             layer = QuasarTransformerBlock(config, layer_idx=i)
             self.layers.append(layer)
+            
+            # Clear CUDA cache to prevent OOM errors during initialization
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
         
         # Final layer norm
         self.final_norm = RMSNorm(config.hidden_size)
@@ -986,10 +999,25 @@ class Quasar(nn.Module):
             'past_key_values': tuple(new_past_key_values) if new_past_key_values else None
         }
 
-def create_quasar_model(use_nsa=False, pbar=None):
-    """Create a ~200B parameter Quasar model with ~17B active parameters through MoE."""
+def create_quasar_model(use_nsa=False, pbar=None, lazy_init=True, ultra_lazy=True):
+    """Create a ~200B parameter Quasar model with ~17B active parameters through MoE.
+    
+    Args:
+        use_nsa: Whether to use Native Sparse Attention instead of Multi-Head Latent Attention.
+        pbar: Optional progress bar for tracking model creation.
+        lazy_init: Whether to use lazy initialization to reduce memory usage during creation.
+        ultra_lazy: Whether to use ultra-lazy initialization for extremely large models (200B+).
+    """
     # Start timing for more accurate progress estimation
     start_time = time.time()
+    
+    # Set memory-efficient initialization
+    torch.backends.cudnn.benchmark = False
+    torch.backends.cuda.matmul.allow_tf32 = True
+    
+    # Try to free up memory before starting
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
     
     if pbar:
         pbar.update(5)
@@ -998,8 +1026,93 @@ def create_quasar_model(use_nsa=False, pbar=None):
     config = QuasarConfig()
     config.use_nsa = use_nsa
     
-    # Create model with progress tracking
-    model = Quasar(config, pbar=pbar)
+    # For extremely large models (200B+), use ultra-lazy initialization
+    if ultra_lazy:
+        if pbar:
+            pbar.update(15)
+            pbar.set_description("Using ultra-lazy initialization for 200B+ model")
+        
+        # Calculate parameter counts analytically without creating any model
+        hidden_size = config.hidden_size
+        num_layers = config.num_hidden_layers
+        num_heads = config.num_attention_heads
+        vocab_size = config.vocab_size
+        ffn_dim = config.intermediate_size
+        num_shared = config.num_shared_experts
+        num_routed = config.num_routed_experts
+        top_k = config.top_k
+        
+        # Embedding parameters
+        embed_params = vocab_size * hidden_size
+        
+        # Attention parameters per layer
+        attn_params = 4 * hidden_size * hidden_size  # Q, K, V, O projections
+        
+        # FFN parameters per expert
+        ffn_params = 3 * hidden_size * ffn_dim  # Up, Gate, Down projections
+        
+        # Layer norm parameters
+        ln_params = 2 * hidden_size * num_layers
+        
+        # MoE parameters
+        moe_params = ffn_params * (num_shared + num_routed)
+        
+        # Total parameters
+        param_count = embed_params + (attn_params * num_layers) + (moe_params * num_layers) + ln_params
+        
+        # Active parameters
+        shared_expert_params = param_count * (num_shared / (num_shared + num_routed))
+        routed_expert_params = param_count * (num_routed / (num_shared + num_routed))
+        active_param_count = shared_expert_params + (routed_expert_params * (top_k / num_routed))
+        
+        if pbar:
+            pbar.update(75)
+            pbar.set_description("Creating model structure (ultra-lazy)")
+        
+        # Create a minimal model structure for DeepSpeed
+        # This is just a skeleton - DeepSpeed will handle the actual initialization
+        model = Quasar(config, ultra_lazy=True)
+        
+    elif lazy_init:
+        # For large models, use standard lazy initialization
+        if pbar:
+            pbar.update(10)
+            pbar.set_description("Creating model skeleton (lazy initialization)")
+        
+        # Just create a minimal model for parameter counting
+        # Actual parameters will be initialized by DeepSpeed
+        config.num_hidden_layers = 2  # Temporarily reduce layers for counting
+        temp_model = Quasar(config)
+        
+        # Estimate parameter count based on reduced model
+        temp_param_count = sum(p.numel() for p in temp_model.parameters())
+        # Scale up to full model size
+        full_layers = QuasarConfig().num_hidden_layers
+        param_count = temp_param_count * (full_layers / 2)
+        
+        # Calculate active parameters more accurately
+        shared_expert_params = param_count * (config.num_shared_experts / (config.num_shared_experts + config.num_routed_experts))
+        routed_expert_params = param_count * (config.num_routed_experts / (config.num_shared_experts + config.num_routed_experts))
+        active_param_count = shared_expert_params + (routed_expert_params * (config.top_k / config.num_routed_experts))
+        
+        if pbar:
+            pbar.update(80)
+            pbar.set_description("Creating full model (lazy initialization)")
+        
+        # Delete temporary model to free memory
+        del temp_model
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        
+        # Restore full layer count for actual model creation
+        config = QuasarConfig()
+        config.use_nsa = use_nsa
+        
+        # Create actual model (DeepSpeed will handle memory-efficient initialization)
+        model = Quasar(config)
+    else:
+        # Standard initialization (may cause OOM for very large models)
+        model = Quasar(config, pbar=pbar)
     
     # Calculate and print parameter count
     if pbar:

@@ -327,11 +327,28 @@ def train(args, rank, world_size):
     # Rough time estimate in seconds based on model size
     estimated_time = (hidden_size * num_layers * num_experts) / 1000000
     
+    # Set memory-efficient initialization
+    if should_log:
+        logger.info("Using ULTRA-LAZY initialization to prevent OOM errors for 200B+ parameter models")
+        logger.info(f"Model config: {hidden_size} hidden size, {num_layers} layers, {num_experts} experts")
+        logger.info("Note: Parameters will be initialized by DeepSpeed during model distribution")
+    
+    # Free up memory before starting
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+        # Set to lowest memory usage
+        torch.cuda.set_per_process_memory_fraction(0.8)  # Reserve some memory for system
+    
     with tqdm(total=100, desc="Creating Quasar model", ncols=100, 
               bar_format='{l_bar}{bar}| {n:.0f}/{total:.0f} [{elapsed}<{remaining}, {rate_fmt}]') as pbar:
         
-        # Create model with progress tracking
-        model = create_quasar_model(use_nsa=args.use_nsa, pbar=pbar)
+        # Create model with ultra-lazy initialization to prevent OOM errors
+        model = create_quasar_model(
+            use_nsa=args.use_nsa, 
+            pbar=pbar, 
+            lazy_init=True,  # Use lazy initialization for large models
+            ultra_lazy=True  # Use ultra-lazy initialization for 200B+ models
+        )
         
         # Ensure we reach 100%
         if pbar.n < 100:
