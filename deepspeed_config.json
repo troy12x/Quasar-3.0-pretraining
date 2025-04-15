@@ -37,12 +37,15 @@
         }
     },
     "scheduler": {
-        "type": "WarmupDecayLR",
+        "type": "CosineWithRestartsLR",
         "params": {
-            "warmup_min_lr": 0,
-            "warmup_max_lr": 0.0003,
-            "warmup_num_steps": 1000,
-            "total_num_steps": 100000
+            "warmup_min_lr": 1e-7,
+            "warmup_max_lr": 0.0006,
+            "warmup_num_steps": 2000,
+            "T_max": 100000,
+            "T_mult": 1,
+            "restarts": 0,
+            "last_epoch": -1
         }
     },
     "gradient_clipping": 1.0,
