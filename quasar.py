@@ -745,12 +745,12 @@ class QuasarConfig:
         eos_token_id=2,
         tie_word_embeddings=True,
         use_moe=True,
-        num_experts=66,  # 2 shared + 64 routed
+        num_experts=33,  # 2 shared + 64 routed
         num_experts_per_token=4,  # Keep as is
         moe_balance_loss_weight=0.01,
         first_layer_no_moe=True,
-        num_shared_experts=2,  # DeepSeek
-        num_routed_experts=64,  # DeepSeek
+        num_shared_experts=1,  # DeepSeek
+        num_routed_experts=32,  # DeepSeek
         top_k=6,  # Reduced from 6 to prevent CUDA indexing errors
         load_balancing_alpha=0.01,
         load_balancing_gamma=0.01,
