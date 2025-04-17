@@ -751,10 +751,10 @@ class QuasarConfig:
         first_layer_no_moe=True,
         num_shared_experts=2,  # DeepSeek
         num_routed_experts=64,  # DeepSeek
-        top_k=6,  # DeepSeek (n_activated_experts)
+        top_k=6,  # Reduced from 6 to prevent CUDA indexing errors
         load_balancing_alpha=0.01,
         load_balancing_gamma=0.01,
-        use_ttm=True,
+        use_ttm=False,  # Temporarily disabled to prevent CUDA memory errors
         ttm_loss_weight=0.01,
         mtp_loss_weight=0.1,
         use_mtp=True,

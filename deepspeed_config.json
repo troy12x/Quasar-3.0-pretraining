@@ -13,14 +13,15 @@
             "device": "cpu",
             "pin_memory": true
         },
+        "stage3_max_live_parameters": 1e8,
+        "stage3_max_reuse_distance": 1e8,
+        "stage3_prefetch_bucket_size": 5e7,
+        "memory_efficient_linear": true,
         "overlap_comm": true,
         "contiguous_gradients": true,
-        "sub_group_size": 1e9,
-        "reduce_bucket_size": 1e9,
-        "stage3_prefetch_bucket_size": 1e9,
-        "stage3_param_persistence_threshold": 1e6,
-        "stage3_max_live_parameters": 1e9,
-        "stage3_max_reuse_distance": 1e9,
+        "reduce_bucket_size": 5e7,
+        "sub_group_size": 1e7,
+        "stage3_param_persistence_threshold": 1e5,
         "stage3_gather_16bit_weights_on_model_save": true
     },
     "fp16": {
@@ -46,9 +47,9 @@
     "scheduler": {
         "type": "WarmupDecayLR",
         "params": {
-            "warmup_min_lr": 1e-7,
-            "warmup_max_lr": 0.0006,
-            "warmup_num_steps": 2000,
+            "warmup_min_lr": 0,
+            "warmup_max_lr": 0.0003,
+            "warmup_num_steps": 1000,
             "total_num_steps": 100000
         }
     },
@@ -66,9 +67,13 @@
     },
     "moe": {
         "enabled": true,
-        "min_capacity": 4,
+        "min_capacity": 16,
+        "capacity_factor": 4.0,
         "noisy_gate_policy": "None",
-        "drop_tokens": true,
-        "use_rts": true
+        "drop_tokens": false,
+        "use_rts": false,
+        "ep_world_size": 8,
+        "ep_mp_size": 1,
+        "use_residual": true
     }
 }
