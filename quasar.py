@@ -730,7 +730,7 @@ class QuasarConfig:
         num_hidden_layers=27,  # DeepSeek (n_layers)
         num_attention_heads=16,  # DeepSeek (n_heads)
         head_dim=16,  # Keep as is unless you want v_head_dim=128
-        intermediate_size=1532,  # DeepSeek (inter_dim)
+        intermediate_size=4096,  # DeepSeek (inter_dim)
         kv_compressed_dim=256,
         query_compressed_dim=512,
         rope_dim_per_head=32,
