@@ -726,15 +726,15 @@ class QuasarConfig:
     def __init__(
         self,
         vocab_size=102400,  # DeepSeek
-         hidden_size=2048,   # DeepSeek (dim)
-         num_hidden_layers=27,  # DeepSeek (n_layers)
-         num_attention_heads=16,  # DeepSeek (n_heads)
-         head_dim=16,  # Keep as is unless you want v_head_dim=128
-         intermediate_size=20944,  # DeepSeek (inter_dim)
-         kv_compressed_dim=256,
-         query_compressed_dim=512,
+        hidden_size=2048,   # DeepSeek (dim)
+        num_hidden_layers=27,  # DeepSeek (n_layers)
+        num_attention_heads=16,  # DeepSeek (n_heads)
+        head_dim=16,  # Keep as is unless you want v_head_dim=128
+        intermediate_size=1532,  # DeepSeek (inter_dim)
+        kv_compressed_dim=256,
+        query_compressed_dim=512,
         rope_dim_per_head=32,
-        max_position_embeddings=8192,  # Keep as is
+        max_position_embeddings=4096,  # Keep as is
         attention_dropout_prob=0.0,
         hidden_dropout_prob=0.0,
         layer_norm_epsilon=1e-5,
@@ -802,7 +802,7 @@ class QuasarConfig:
             setattr(self, key, value)
 
 class Quasar(nn.Module):
-    def __init__(self, config, pbar=None, use_meta_device=False, ultra_lazy=False):
+    def __init__(self, config, pbar=None, use_meta_device=False, ultra_lazy=False, distributed_init=False, rank=0, world_size=1):
         super().__init__()
         self.config = config
         
@@ -810,6 +810,9 @@ class Quasar(nn.Module):
         # This just creates the structure without allocating memory
         self.use_meta_device = use_meta_device
         self.ultra_lazy = ultra_lazy
+        self.distributed_init = distributed_init
+        self.rank = rank
+        self.world_size = world_size
         
         if pbar:
             pbar.update(5)
@@ -999,7 +1002,7 @@ class Quasar(nn.Module):
             'past_key_values': tuple(new_past_key_values) if new_past_key_values else None
         }
 
-def create_quasar_model(use_nsa=False, pbar=None, lazy_init=True, ultra_lazy=True):
+def create_quasar_model(use_nsa=False, pbar=None, lazy_init=True, ultra_lazy=True, distributed_init=True):
     """Create a ~200B parameter Quasar model with ~17B active parameters through MoE.
     
     Args:
@@ -1007,6 +1010,7 @@ def create_quasar_model(use_nsa=False, pbar=None, lazy_init=True, ultra_lazy=Tru
         pbar: Optional progress bar for tracking model creation.
         lazy_init: Whether to use lazy initialization to reduce memory usage during creation.
         ultra_lazy: Whether to use ultra-lazy initialization for extremely large models (200B+).
+        distributed_init: Whether to use distributed initialization for multi-GPU setups.
     """
     # Start timing for more accurate progress estimation
     start_time = time.time()
@@ -1018,6 +1022,8 @@ def create_quasar_model(use_nsa=False, pbar=None, lazy_init=True, ultra_lazy=Tru
     # Try to free up memory before starting
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
+        # Set memory fraction to prevent OOM
+        torch.cuda.set_per_process_memory_fraction(0.9)
     
     if pbar:
         pbar.update(5)
@@ -1026,8 +1032,74 @@ def create_quasar_model(use_nsa=False, pbar=None, lazy_init=True, ultra_lazy=Tru
     config = QuasarConfig()
     config.use_nsa = use_nsa
     
-    # For extremely large models (200B+), use ultra-lazy initialization
-    if ultra_lazy:
+    # Check if we're in a distributed environment
+    is_distributed = torch.distributed.is_available() and torch.distributed.is_initialized()
+    
+    # For multi-GPU distributed initialization of extremely large models
+    if distributed_init and is_distributed:
+        if pbar:
+            pbar.update(15)
+            pbar.set_description("Using distributed initialization for multi-GPU setup")
+        
+        # Get distributed info
+        world_size = torch.distributed.get_world_size()
+        rank = torch.distributed.get_rank()
+        
+        if pbar and rank == 0:
+            pbar.set_description(f"Distributed init across {world_size} GPUs (rank {rank})")
+        
+        # Calculate parameter counts analytically without creating any model
+        hidden_size = config.hidden_size
+        num_layers = config.num_hidden_layers
+        num_heads = config.num_attention_heads
+        vocab_size = config.vocab_size
+        ffn_dim = config.intermediate_size
+        num_shared = config.num_shared_experts
+        num_routed = config.num_routed_experts
+        top_k = config.top_k
+        
+        # Embedding parameters
+        embed_params = vocab_size * hidden_size
+        
+        # Attention parameters per layer
+        attn_params = 4 * hidden_size * hidden_size  # Q, K, V, O projections
+        
+        # FFN parameters per expert
+        ffn_params = 3 * hidden_size * ffn_dim  # Up, Gate, Down projections
+        
+        # Layer norm parameters
+        ln_params = 2 * hidden_size * num_layers
+        
+        # MoE parameters
+        moe_params = ffn_params * (num_shared + num_routed)
+        
+        # Total parameters
+        param_count = embed_params + (attn_params * num_layers) + (moe_params * num_layers) + ln_params
+        
+        # Active parameters
+        shared_expert_params = param_count * (num_shared / (num_shared + num_routed))
+        routed_expert_params = param_count * (num_routed / (num_shared + num_routed))
+        active_param_count = shared_expert_params + (routed_expert_params * (top_k / num_routed))
+        
+        # Calculate per-GPU parameters (for ZeRO-3)
+        per_gpu_params = param_count / world_size
+        
+        if pbar and rank == 0:
+            pbar.update(25)
+            pbar.set_description(f"Estimated {param_count/1e9:.2f}B params ({per_gpu_params/1e9:.2f}B per GPU)")
+        
+        # Synchronize all processes before creating model
+        torch.distributed.barrier()
+        
+        # Create empty model shell - DeepSpeed will handle parameter initialization
+        model = Quasar(config, distributed_init=True, rank=rank, world_size=world_size)
+        
+        if pbar and rank == 0:
+            pbar.update(50)
+            pbar.set_description("Model structure created, waiting for DeepSpeed init")
+    
+    # For extremely large models (200B+) on single GPU, use ultra-lazy initialization
+    elif ultra_lazy:
         if pbar:
             pbar.update(15)
             pbar.set_description("Using ultra-lazy initialization for 200B+ model")

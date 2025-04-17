@@ -23,11 +23,11 @@ else
 fi
 
 # Training parameters
-MICRO_BATCH_SIZE=4
+MICRO_BATCH_SIZE=2
 GRADIENT_ACCUMULATION_STEPS=4
 PRECISION="bf16"
 OUTPUT_DIR="./checkpoints"
-SAVE_STEPS=1000
+SAVE_STEPS=100
 LOGGING_STEPS=10
 RUN_NAME="quasar3-training-$(date +%Y%m%d-%H%M%S)"
 
