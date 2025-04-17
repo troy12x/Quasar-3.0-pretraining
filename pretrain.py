@@ -54,7 +54,7 @@ class MultiDataset(Dataset):
         
         # 1. Load all subsets from eyad-silx/wiki-pretrain
         logger.info(f"Loading wiki-pretrain datasets ({split} split)...")
-        wiki_subsets = ["ar", "en"]
+        wiki_subsets = ["ab"]
         for subset in wiki_subsets:
             try:
                 dataset = load_dataset("eyad-silx/wiki-pretrain", subset, split=split, cache_dir=cache_dir)
@@ -67,26 +67,26 @@ class MultiDataset(Dataset):
         
         # 2. Load code pretraining data
         logger.info(f"Loading code pretraining data ({split} split)...")
-        try:
-            code_dataset = load_dataset("ZhentingNLP/code_pretraining_data", split=split, cache_dir=cache_dir)
-            self.datasets.append(code_dataset)
-            self.dataset_sizes.append(len(code_dataset))
-            self.total_size += len(code_dataset)
-            logger.info(f"Loaded code_pretraining_data with {len(code_dataset)} examples")
-        except Exception as e:
-            logger.warning(f"Failed to load code_pretraining_data: {e}")
+        #try:
+           # code_dataset = load_dataset("ZhentingNLP/code_pretraining_data", split=split, cache_dir=cache_dir)
+            #self.datasets.append(code_dataset)
+           # self.dataset_sizes.append(len(code_dataset))
+            #self.total_size += len(code_dataset)
+            #logger.info(f"Loaded code_pretraining_data with {len(code_dataset)} examples")
+      #  except Exception as e:
+         #   logger.warning(f"Failed to load code_pretraining_data: {e}")
         
         # 3. Load Arabic pretraining data as backup
-        if not self.datasets:
-            logger.info(f"Loading Arabic pretraining data as backup ({split} split)...")
-            try:
-                arabic_dataset = load_dataset("Ashmal/Arabic_Pretraining_10K", split=split, cache_dir=cache_dir)
-                self.datasets.append(arabic_dataset)
-                self.dataset_sizes.append(len(arabic_dataset))
-                self.total_size += len(arabic_dataset)
-                logger.info(f"Loaded Arabic_Pretraining_10K with {len(arabic_dataset)} examples")
-            except Exception as e:
-                logger.warning(f"Failed to load Arabic_Pretraining_10K: {e}")
+       # if not self.datasets:
+           # logger.info(f"Loading Arabic pretraining data as backup ({split} split)...")
+          #  try:
+              #  arabic_dataset = load_dataset("Ashmal/Arabic_Pretraining_10K", split=split, cache_dir=cache_dir)
+              #  self.datasets.append(arabic_dataset)
+              #  self.dataset_sizes.append(len(arabic_dataset))
+                #self.total_size += len(arabic_dataset)
+               # logger.info(f"Loaded Arabic_Pretraining_10K with {len(arabic_dataset)} examples")
+        #    except Exception as e:
+              #  logger.warning(f"Failed to load Arabic_Pretraining_10K: {e}")
         
         # Check if we have any datasets loaded
         if not self.datasets:
