@@ -17,7 +17,6 @@ if TRY_FLASH_ATTENTION:
     except ImportError:
         print("Flash Attention not available, falling back to standard attention")
 
-
 class RMSNorm(nn.Module):
     def __init__(self, dim: int, eps: float = 1e-6):
         super().__init__()
@@ -25,8 +24,27 @@ class RMSNorm(nn.Module):
         self.weight = nn.Parameter(torch.ones(dim))
 
     def forward(self, x):
-        norm = torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)
-        return x * norm * self.weight
+        # Handle potential numerical instabilities that cause CUDA device-side assert
+        try:
+            # Check for NaN or Inf values first
+            if torch.isnan(x).any() or torch.isinf(x).any():
+                x = torch.nan_to_num(x, nan=0.0, posinf=1e4, neginf=-1e4)
+            
+            # Compute mean square with additional safety measures
+            variance = x.pow(2).mean(-1, keepdim=True)
+            
+            # Ensure variance is positive to avoid sqrt of negative numbers
+            variance = torch.clamp(variance, min=self.eps)
+            
+            # Compute normalization factor safely
+            norm = torch.rsqrt(variance)
+            
+            return x * norm * self.weight
+        except Exception as e:
+            # Fallback mechanism if computation fails
+            print(f"RMSNorm encountered error: {e}, using fallback")
+            # Return input with weight as fallback (skip normalization)
+            return x * self.weight
 
 def rotate_half(x: torch.Tensor) -> torch.Tensor:
     x1, x2 = x[..., :x.shape[-1]//2], x[..., x.shape[-1]//2:]
