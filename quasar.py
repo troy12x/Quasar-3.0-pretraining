@@ -19,32 +19,35 @@ if TRY_FLASH_ATTENTION:
 
 class RMSNorm(nn.Module):
     def __init__(self, dim: int, eps: float = 1e-6):
+        """RMSNorm implementation based on DeepSeekV3RMSNorm for numerical stability.
+        
+        This implementation explicitly handles dtype conversion to ensure stable computation.
+        """
         super().__init__()
-        self.eps = eps
         self.weight = nn.Parameter(torch.ones(dim))
+        self.variance_epsilon = eps
 
     def forward(self, x):
-        # Handle potential numerical instabilities that cause CUDA device-side assert
+        # Store original input dtype
+        input_dtype = x.dtype
+        
+        # Convert to float32 for stable computation
+        x = x.to(torch.float32)
+        
         try:
-            # Check for NaN or Inf values first
-            if torch.isnan(x).any() or torch.isinf(x).any():
-                x = torch.nan_to_num(x, nan=0.0, posinf=1e4, neginf=-1e4)
-            
-            # Compute mean square with additional safety measures
+            # Compute variance in float32 precision
             variance = x.pow(2).mean(-1, keepdim=True)
             
-            # Ensure variance is positive to avoid sqrt of negative numbers
-            variance = torch.clamp(variance, min=self.eps)
+            # Apply normalization with epsilon for numerical stability
+            x = x * torch.rsqrt(variance + self.variance_epsilon)
             
-            # Compute normalization factor safely
-            norm = torch.rsqrt(variance)
-            
-            return x * norm * self.weight
+            # Apply weight and convert back to original dtype
+            return (self.weight * x).to(input_dtype)
         except Exception as e:
             # Fallback mechanism if computation fails
             print(f"RMSNorm encountered error: {e}, using fallback")
             # Return input with weight as fallback (skip normalization)
-            return x * self.weight
+            return (x * self.weight).to(input_dtype)
 
 def rotate_half(x: torch.Tensor) -> torch.Tensor:
     x1, x2 = x[..., :x.shape[-1]//2], x[..., x.shape[-1]//2:]
