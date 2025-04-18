@@ -747,16 +747,16 @@ class QuasarTransformerBlock(nn.Module):
 class QuasarConfig:
     def __init__(
         self,
-        vocab_size=102400,  # DeepSeek
-        hidden_size=2048,   # DeepSeek (dim)
-        num_hidden_layers=20,  # DeepSeek (n_layers)
-        num_attention_heads=128,  # DeepSeek (n_heads)
-        head_dim=128,  # Keep as is unless you want v_head_dim=128
-        intermediate_size=4096,  # DeepSeek (inter_dim)
-        kv_compressed_dim=256,
-        query_compressed_dim=512,
+        vocab_size=128128,
+        hidden_size=1536,  # Reduced from 2048
+        num_hidden_layers=12,  # Reduced from 20
+        num_attention_heads=12,  # Reduced from 16
+        head_dim=128,
+        intermediate_size=4096,  # Reduced from 5632
+        kv_compressed_dim=192,  # Reduced from 256
+        query_compressed_dim=384,  # Reduced from 512
         rope_dim_per_head=32,
-        max_position_embeddings=4096,  # Keep as is
+        max_position_embeddings=4096,
         attention_dropout_prob=0.0,
         hidden_dropout_prob=0.0,
         layer_norm_epsilon=1e-5,
@@ -767,20 +767,19 @@ class QuasarConfig:
         eos_token_id=2,
         tie_word_embeddings=True,
         use_moe=True,
-        num_experts=11,  # 2 shared + 64 routed
-        num_experts_per_token=2,  # Keep as is
+        num_experts=16,  # Reduced from 64
+        num_experts_per_token=4,
         moe_balance_loss_weight=0.01,
         first_layer_no_moe=True,
-        num_shared_experts=1,  # DeepSeek
-        num_routed_experts=10,  # DeepSeek
-        top_k=6,  # Reduced from 6 to prevent CUDA indexing errors
+        num_shared_experts=1,
+        num_routed_experts=16,  # Reduced from 64
+        top_k=4,
         load_balancing_alpha=0.01,
         load_balancing_gamma=0.01,
-        use_ttm=False,  # Temporarily disabled to prevent CUDA memory errors
+        use_ttm=False,
         ttm_loss_weight=0.01,
         mtp_loss_weight=0.1,
         use_mtp=True,
-        use_rope=True,
         use_nsa=False,
         **kwargs
     ):
