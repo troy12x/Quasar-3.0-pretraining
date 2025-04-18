@@ -1,961 +1,1216 @@
-import os
 import math
+import time
 import torch
 import torch.nn as nn
-import torch.optim as optim
-import torch.distributed as dist
-import torch.multiprocessing as mp
-from torch.nn.parallel import DistributedDataParallel as DDP
-from torch.utils.data import DataLoader, Dataset
-from torch.utils.data.distributed import DistributedSampler
-from torch.optim.lr_scheduler import CosineAnnealingLR
-from datasets import load_dataset
-from transformers import PreTrainedTokenizerFast
-from tqdm import tqdm
-import logging
-import argparse
-import wandb
-import numpy as np
-import json
-from quasar import QuasarConfig, create_quasar_model
-import torch.cuda.amp as amp
+import torch.nn.functional as F
+from native_sparse_attention import NativeSparseAttention
 
-# Set multiprocessing start method to 'spawn' for CUDA compatibility
-mp.set_start_method('spawn', force=True)
+# Check if Flash Attention is available
+TRY_FLASH_ATTENTION = True
+HAS_FLASH_ATTENTION = False
+if TRY_FLASH_ATTENTION:
+    try:
+        from flash_attn import flash_attn_func, flash_attn_varlen_func
+        from flash_attn.bert_padding import index_first_axis, pad_input, unpad_input
+        HAS_FLASH_ATTENTION = True
+        print("Flash Attention is available and will be used for faster training")
+    except ImportError:
+        print("Flash Attention not available, falling back to standard attention")
 
-# Import DeepSpeed if available
-try:
-    import deepspeed
-    from deepspeed.ops.adam import DeepSpeedCPUAdam, FusedAdam
-    from deepspeed.utils.zero_to_fp32 import get_fp32_state_dict_from_zero_checkpoint
-    DEEPSPEED_AVAILABLE = True
-except ImportError:
-    DEEPSPEED_AVAILABLE = False
 
-# Setup logging
-logging.basicConfig(
-    format="%(asctime)s - %(levelname)s - %(name)s - %(message)s",
-    datefmt="%m/%d/%Y %H:%M:%S",
-    level=logging.INFO,
-)
-logger = logging.getLogger(__name__)
+class RMSNorm(nn.Module):
+    def __init__(self, dim: int, eps: float = 1e-6):
+        super().__init__()
+        self.eps = eps
+        self.weight = nn.Parameter(torch.ones(dim))
 
-# Function to check if this is the main process
-def is_main_process(local_rank):
-    return local_rank in [-1, 0]
+    def forward(self, x):
+        norm = torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)
+        return x * norm * self.weight
 
-class MultiDataset(Dataset):
-    def __init__(self, tokenizer, split="train", max_length=8129, cache_dir=None):
-        self.tokenizer = tokenizer
-        self.max_length = max_length
-        self.datasets = []
-        self.dataset_sizes = []
-        self.total_size = 0
-        
-        # 1. Load all subsets from eyad-silx/wiki-pretrain
-        logger.info(f"Loading wiki-pretrain datasets ({split} split)...")
-        wiki_subsets = ["ab"]
-        for subset in wiki_subsets:
-            try:
-                dataset = load_dataset("eyad-silx/wiki-pretrain", subset, split=split, cache_dir=cache_dir)
-                self.datasets.append(dataset)
-                self.dataset_sizes.append(len(dataset))
-                self.total_size += len(dataset)
-                logger.info(f"Loaded wiki-pretrain/{subset} with {len(dataset)} examples")
-            except Exception as e:
-                logger.warning(f"Failed to load wiki-pretrain/{subset}: {e}")
-        
-        # 2. Load code pretraining data
-        logger.info(f"Loading code pretraining data ({split} split)...")
-        #try:
-           # code_dataset = load_dataset("ZhentingNLP/code_pretraining_data", split=split, cache_dir=cache_dir)
-            #self.datasets.append(code_dataset)
-           # self.dataset_sizes.append(len(code_dataset))
-            #self.total_size += len(code_dataset)
-            #logger.info(f"Loaded code_pretraining_data with {len(code_dataset)} examples")
-      #  except Exception as e:
-         #   logger.warning(f"Failed to load code_pretraining_data: {e}")
-        
-        # 3. Load Arabic pretraining data as backup
-       # if not self.datasets:
-           # logger.info(f"Loading Arabic pretraining data as backup ({split} split)...")
-          #  try:
-              #  arabic_dataset = load_dataset("Ashmal/Arabic_Pretraining_10K", split=split, cache_dir=cache_dir)
-              #  self.datasets.append(arabic_dataset)
-              #  self.dataset_sizes.append(len(arabic_dataset))
-                #self.total_size += len(arabic_dataset)
-               # logger.info(f"Loaded Arabic_Pretraining_10K with {len(arabic_dataset)} examples")
-        #    except Exception as e:
-              #  logger.warning(f"Failed to load Arabic_Pretraining_10K: {e}")
-        
-        # Check if we have any datasets loaded
-        if not self.datasets:
-            logger.error("Failed to load any datasets! Training will not work.")
-        else:
-            logger.info(f"Successfully loaded {len(self.datasets)} datasets with a total of {self.total_size} examples")
+def rotate_half(x: torch.Tensor) -> torch.Tensor:
+    x1, x2 = x[..., :x.shape[-1]//2], x[..., x.shape[-1]//2:]
+    return torch.cat([-x2, x1], dim=-1)
+
+def apply_rotary_pos_emb(q: torch.Tensor, k: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """Apply rotary position embeddings to queries and keys.
     
-    def __len__(self):
-        return self.total_size
+    This implementation is designed to be robust to dimension mismatches, which can occur
+    when using different model configurations or when integrating with DeepSpeed.
     
-    def __getitem__(self, idx):
-        # Find which dataset this index belongs to
-        dataset_idx = 0
-        local_idx = idx
+    Args:
+        q: Query tensor of shape [batch, seq, heads, head_dim]
+        k: Key tensor of shape [batch, seq, heads, head_dim]
+        cos: Cosine tensor from precomputed_freqs_cis
+        sin: Sine tensor from precomputed_freqs_cis
         
-        while dataset_idx < len(self.dataset_sizes) and local_idx >= self.dataset_sizes[dataset_idx]:
-            local_idx -= self.dataset_sizes[dataset_idx]
-            dataset_idx += 1
+    Returns:
+        Tuple of rotary position embedded query and key tensors
+    """
+    # Get dimensions
+    batch_size, seq_len, num_heads, head_dim = q.shape
+    
+    # Handle different cos/sin tensor shapes
+    if cos.dim() == 2:
+        # Shape [seq_len, dim]
+        cos = cos.unsqueeze(0).unsqueeze(2)  # [1, seq_len, 1, dim]
+        sin = sin.unsqueeze(0).unsqueeze(2)  # [1, seq_len, 1, dim]
+    elif cos.dim() == 3:
+        # Shape [batch, seq_len, dim]
+        cos = cos.unsqueeze(2)  # [batch, seq_len, 1, dim]
+        sin = sin.unsqueeze(2)  # [batch, seq_len, 1, dim]
+    
+    # Ensure the sequence length matches
+    if cos.size(1) < seq_len:
+        # Pad if needed (should be rare)
+        pad_len = seq_len - cos.size(1)
+        cos_padding = cos[:, -1:].expand(-1, pad_len, -1, -1)
+        sin_padding = sin[:, -1:].expand(-1, pad_len, -1, -1)
+        cos = torch.cat([cos, cos_padding], dim=1)
+        sin = torch.cat([sin, sin_padding], dim=1)
+    elif cos.size(1) > seq_len:
+        # Truncate if needed
+        cos = cos[:, :seq_len]
+        sin = sin[:, :seq_len]
+    
+    # Ensure the feature dimension matches
+    feature_dim = cos.size(-1)
+    if feature_dim < head_dim:
+        # Pad with zeros if needed
+        pad_dim = head_dim - feature_dim
+        cos = F.pad(cos, (0, pad_dim))
+        sin = F.pad(sin, (0, pad_dim))
+    elif feature_dim > head_dim:
+        # Truncate if needed
+        cos = cos[..., :head_dim]
+        sin = sin[..., :head_dim]
+    
+    # Expand to match batch size and number of heads
+    if cos.size(0) == 1 and batch_size > 1:
+        cos = cos.expand(batch_size, -1, -1, -1)
+        sin = sin.expand(batch_size, -1, -1, -1)
+    
+    if cos.size(2) == 1 and num_heads > 1:
+        cos = cos.expand(-1, -1, num_heads, -1)
+        sin = sin.expand(-1, -1, num_heads, -1)
+    
+    # Apply rotary embeddings
+    q_embed = (q * cos) + (rotate_half(q) * sin)
+    k_embed = (k * cos) + (rotate_half(k) * sin)
+    
+    return q_embed, k_embed
+
+def precompute_freqs_cis(dim: int, end: int, theta: float = 10000.0) -> tuple[torch.Tensor, torch.Tensor]:
+    """Precompute the frequency tensor for complex exponentials (cos, sin)."""
+    freqs = 1.0 / (theta ** (torch.arange(0, dim, 2)[: (dim // 2)].float() / dim))
+    t = torch.arange(end, device=freqs.device)
+    freqs = torch.outer(t, freqs)
+    cos, sin = torch.cos(freqs), torch.sin(freqs)
+    return cos.float(), sin.float()
+
+class MultiHeadLatentAttention(nn.Module):
+    def __init__(self, config):
+        super().__init__()
+        self.config = config  # Store config for later reference
+        self.hidden_size = config.hidden_size  # d
+        self.num_heads = config.num_attention_heads  # nh
+        self.head_dim = config.head_dim  # dh
+        self.kv_compressed_dim = config.kv_compressed_dim  # dc
+        self.query_compressed_dim = config.query_compressed_dim  # d'c
+        self.rope_dim_per_head = config.rope_dim_per_head  # dRh
         
-        if dataset_idx >= len(self.datasets):
-            raise IndexError(f"Index {idx} out of range for combined dataset of size {self.total_size}")
+        # Projection matrices
+        self.W_DKV = nn.Linear(self.hidden_size, self.kv_compressed_dim)
+        self.W_UK = nn.Linear(self.kv_compressed_dim, self.num_heads * self.head_dim)
+        self.W_UV = nn.Linear(self.kv_compressed_dim, self.num_heads * self.head_dim)
         
-        # Get the item from the appropriate dataset
-        item = self.datasets[dataset_idx][local_idx]
-        
-        # Extract text based on dataset format
-        if "text" in item:
-            text = item["text"]
-        elif "page" in item:
-            text = item["page"]
-        elif "content" in item:  # For code dataset
-            text = item["content"]
+        # Query projection
+        if self.query_compressed_dim is not None:
+            self.W_DQ = nn.Linear(self.hidden_size, self.query_compressed_dim)
+            self.W_UQ = nn.Linear(self.query_compressed_dim, self.num_heads * self.head_dim)
         else:
-            # Get the first field that contains text
-            for key, value in item.items():
-                if isinstance(value, str) and len(value) > 0:
-                    text = value
-                    break
+            self.W_Q = nn.Linear(self.hidden_size, self.num_heads * self.head_dim)
+        
+        # Rotary projections if using partial rotary
+        if self.rope_dim_per_head > 0 and self.rope_dim_per_head < self.head_dim:
+            self.W_QR = nn.Linear(self.head_dim, self.rope_dim_per_head, bias=False)
+            self.W_KR = nn.Linear(self.head_dim, self.rope_dim_per_head, bias=False)
+        else:
+            self.W_QR = None
+            self.W_KR = None
+        
+        # Output projection
+        self.W_O = nn.Linear(self.num_heads * self.head_dim, self.hidden_size)
+        
+        # Dropout
+        self.attention_dropout = getattr(config, 'attention_dropout_prob', 0.0)
+        
+        # Precompute freqs for RoPE
+        self.register_buffer("cos", None, persistent=False)
+        self.register_buffer("sin", None, persistent=False)
+        self.max_seq_length = 0
+        
+        # TTM flag - only used for loss modulation, not to replace MLA
+        self.use_ttm = getattr(config, 'use_ttm', False)
+        
+    def forward(self, hidden_states, attention_mask=None, past_key_value=None, position_ids=None, token_temperatures=None):
+        batch_size, seq_length = hidden_states.shape[:2]
+        
+        # Initialize position_ids if not provided
+        if position_ids is None:
+            position_ids = torch.arange(seq_length, dtype=torch.long, device=hidden_states.device).unsqueeze(0)
+            position_ids = position_ids.expand(batch_size, -1)
+        
+        # Initialize or extend position_ids based on past_key_value
+        past_length = 0
+        if past_key_value is not None:
+            # past_key_value[0] shape: [batch_size, num_heads, seq_length, head_dim] or [batch_size, seq_length, num_heads, head_dim]
+            if past_key_value[0].dim() >= 3:
+                if past_key_value[0].dim() == 4 and past_key_value[0].shape[1] == self.num_heads:
+                    # [batch_size, num_heads, seq_length, head_dim] format
+                    past_length = past_key_value[0].shape[2]
+                else:
+                    # [batch_size, seq_length, ...] format
+                    past_length = past_key_value[0].shape[1]
+                
+                # Ensure position_ids are correctly sliced
+                if position_ids.shape[1] > seq_length:
+                    position_ids = position_ids[:, -seq_length:]
+        
+        # Compute key and value
+        c_kv = self.W_DKV(hidden_states)  # [batch, seq, dc]
+        k = self.W_UK(c_kv)  # [batch, seq, nh*dh]
+        v = self.W_UV(c_kv)  # [batch, seq, nh*dh]
+        
+        # Compute query
+        if hasattr(self, 'W_DQ') and hasattr(self, 'W_UQ'):
+            c_q = self.W_DQ(hidden_states)  # [batch, seq, d'c]
+            q = self.W_UQ(c_q)  # [batch, seq, nh*dh]
+        else:
+            q = self.W_Q(hidden_states)  # [batch, seq, nh*dh]
+        
+        # Reshape q, k, v for multi-head attention
+        q = q.view(batch_size, seq_length, self.num_heads, self.head_dim)
+        k = k.view(batch_size, seq_length, self.num_heads, self.head_dim)
+        v = v.view(batch_size, seq_length, self.num_heads, self.head_dim)
+        
+        # Apply rotary position embeddings
+        if self.rope_dim_per_head > 0:
+            # Precompute freqs_cis if not already done
+            if self.cos is None or self.sin is None or self.max_seq_length < seq_length + past_length:
+                self.max_seq_length = max(self.max_seq_length, seq_length + past_length)
+                # Only apply RoPE to a subset of dimensions if specified
+                dim = min(self.rope_dim_per_head, self.head_dim)
+                self.cos, self.sin = precompute_freqs_cis(dim, self.max_seq_length * 2)
+                self.cos = self.cos.to(hidden_states.device)
+                self.sin = self.sin.to(hidden_states.device)
+            
+            # Get the appropriate part of position embeddings
+            # Ensure position_ids are within bounds
+            max_pos = self.cos.size(0) - 1
+            safe_pos_ids = torch.clamp(position_ids, 0, max_pos)
+            
+            # Use gather instead of index_select for better handling of batched position_ids
+            # This handles both 1D and 2D position_ids correctly
+            if safe_pos_ids.dim() == 2:
+                # For batched position_ids [batch_size, seq_length]
+                cos_seq = self.cos[None, :, :].expand(batch_size, -1, -1)
+                sin_seq = self.sin[None, :, :].expand(batch_size, -1, -1)
+                
+                # Create indices for gather
+                batch_indices = torch.arange(batch_size, device=safe_pos_ids.device)[:, None]
+                batch_indices = batch_indices.expand(-1, seq_length)
+                
+                # Gather using the position_ids
+                cos = cos_seq.gather(1, safe_pos_ids.unsqueeze(-1).expand(-1, -1, cos_seq.size(-1)))
+                sin = sin_seq.gather(1, safe_pos_ids.unsqueeze(-1).expand(-1, -1, sin_seq.size(-1)))
             else:
-                text = "This is a fallback text for empty examples."
+                # For single position_ids [seq_length]
+                cos = self.cos[safe_pos_ids]
+                sin = self.sin[safe_pos_ids]
+                # Reshape to [1, seq_length, dim]
+                cos = cos.unsqueeze(0)
+                sin = sin.unsqueeze(0)
+            
+            # Convert to query/key dtype
+            cos = cos.to(q.dtype)
+            sin = sin.to(q.dtype)
+            
+            # Apply partial rotary if needed
+            if self.W_QR is not None and self.W_KR is not None:
+                # Project q and k to lower dimension for RoPE
+                q_flat = q.reshape(-1, self.head_dim)
+                k_flat = k.reshape(-1, self.head_dim)
+                
+                q_r = self.W_QR(q_flat).reshape(batch_size, seq_length, self.num_heads, self.rope_dim_per_head)
+                k_r = self.W_KR(k_flat).reshape(batch_size, seq_length, self.num_heads, self.rope_dim_per_head)
+                
+                # Apply rotary embeddings to the projected dimensions
+                q_r, k_r = apply_rotary_pos_emb(q_r, k_r, cos, sin)
+                
+                # Combine the rotary and non-rotary parts
+                q_rotary = q_r.reshape(-1, self.rope_dim_per_head)
+                k_rotary = k_r.reshape(-1, self.rope_dim_per_head)
+                
+                # Use the original tensors but replace the rotary part
+                q_flat[:, :self.rope_dim_per_head] = q_rotary
+                k_flat[:, :self.rope_dim_per_head] = k_rotary
+                
+                # Reshape back
+                q = q_flat.reshape(batch_size, seq_length, self.num_heads, self.head_dim)
+                k = k_flat.reshape(batch_size, seq_length, self.num_heads, self.head_dim)
+                
+                # Use the modified q and k as q_r and k_r
+                q_r, k_r = q, k
+            else:
+                # Apply full rotary embeddings
+                q_r, k_r = apply_rotary_pos_emb(q, k, cos, sin)
+        else:
+            q_r, k_r = q, k
         
-        # Tokenize text
-        encodings = self.tokenizer(
-            text,
-            max_length=self.max_length,
-            truncation=True,
-            padding="max_length",
-            return_tensors="pt"
+        # Extend k, v with past_key_value if provided
+        if past_key_value is not None:
+            k_r = torch.cat([past_key_value[0], k_r], dim=1)
+            v = torch.cat([past_key_value[1], v], dim=1)
+        
+        # Save current k, v for future use
+        current_key_value = (k_r, v)
+        
+        # Transpose for attention computation
+        q_r = q_r.transpose(1, 2)  # [batch, num_heads, seq_length, head_dim]
+        k_r = k_r.transpose(1, 2)  # [batch, num_heads, kv_seq_length, head_dim]
+        v = v.transpose(1, 2)   # [batch, num_heads, kv_seq_length, head_dim]
+        
+        # Compute attention scores
+        attention_scores = torch.matmul(q_r, k_r.transpose(-1, -2))
+        attention_scores = attention_scores / math.sqrt(self.head_dim)
+        
+        # Apply attention mask if provided
+        if attention_mask is not None:
+            # Expand mask to match attention_scores dimensions
+            if attention_mask.dim() == 2:
+                attention_mask = attention_mask.unsqueeze(1).unsqueeze(1)
+            attention_mask = attention_mask.to(attention_scores.dtype)
+            attention_mask = (1.0 - attention_mask) * torch.finfo(attention_scores.dtype).min
+            attention_scores = attention_scores + attention_mask
+        
+        # Apply token temperature modulation if provided
+        if token_temperatures is not None:
+            # Reshape token_temperatures to match attention_scores
+            temps = token_temperatures.unsqueeze(1).unsqueeze(1)  # [batch, 1, 1, seq]
+            # Apply temperature scaling to attention scores
+            attention_scores = attention_scores * temps
+        
+        # Convert scores to probabilities
+        attention_probs = F.softmax(attention_scores, dim=-1)
+        
+        # Apply attention dropout
+        attention_probs = F.dropout(attention_probs, p=self.attention_dropout, training=self.training)
+        
+        # Compute context vectors - ensure matching dtype
+        # Convert attention_probs to v's dtype to avoid mismatch
+        attention_probs = attention_probs.to(dtype=v.dtype)
+        context = torch.matmul(attention_probs, v)
+        context = context.transpose(1, 2).contiguous()  # [batch, seq_length, num_heads, head_dim]
+        
+        # Reshape context back to [batch, seq, hidden_size]
+        context = context.view(batch_size, seq_length, self.hidden_size)
+        
+        # Apply output projection
+        output = self.W_O(context)
+        
+        return output, current_key_value
+
+class NSAAttention(nn.Module):
+    """
+    Native Sparse Attention implementation for Quasar model.
+    Integrates with the existing architecture while using the NSA mechanism.
+    """
+    def __init__(self, config):
+        super().__init__()
+        self.hidden_size = config.hidden_size
+        self.num_heads = config.num_attention_heads
+        self.head_dim = config.head_dim
+        
+        # Query, Key, Value projections
+        self.q_proj = nn.Linear(self.hidden_size, self.num_heads * self.head_dim)
+        self.k_proj = nn.Linear(self.hidden_size, self.num_heads * self.head_dim)
+        self.v_proj = nn.Linear(self.hidden_size, self.num_heads * self.head_dim)
+        
+        # Native Sparse Attention mechanism
+        self.nsa = NativeSparseAttention(config)
+        
+        # Precompute freqs for RoPE
+        self.register_buffer("cos", None, persistent=False)
+        self.register_buffer("sin", None, persistent=False)
+        self.rope_dim_per_head = config.rope_dim_per_head
+        
+        # Attention dropout for regularization
+        self.attention_dropout = getattr(config, 'attention_dropout_prob', 0.0)
+        
+    def forward(self, hidden_states, attention_mask=None, past_key_value=None, position_ids=None):
+        batch_size, seq_length = hidden_states.shape[:2]
+        
+        # Initialize or extend position_ids
+        if position_ids is None:
+            if past_key_value is None:
+                position_ids = torch.arange(seq_length, device=hidden_states.device)
+            else:
+                position_ids = torch.arange(past_key_value[0].size(1), past_key_value[0].size(1) + seq_length, device=hidden_states.device)
+        
+        # Initialize RoPE freq cache if needed
+        if self.cos is None or self.cos.size(0) < position_ids.max() + 1:
+            max_seq_len = max(position_ids.max() + 1, self.config.max_position_embeddings)
+            self.cos, self.sin = precompute_freqs_cis(self.rope_dim_per_head, max_seq_len)
+            self.cos = self.cos.to(hidden_states.device)
+            self.sin = self.sin.to(hidden_states.device)
+        
+        # Project to query, key, value
+        q = self.q_proj(hidden_states).view(batch_size, seq_length, self.num_heads, self.head_dim)
+        k = self.k_proj(hidden_states).view(batch_size, seq_length, self.num_heads, self.head_dim)
+        v = self.v_proj(hidden_states).view(batch_size, seq_length, self.num_heads, self.head_dim)
+        
+        # Apply RoPE to query and key
+        cos = self.cos[position_ids]
+        sin = self.sin[position_ids]
+        q, k = apply_rotary_pos_emb(
+            q.transpose(1, 2),  # [batch, heads, seq, head_dim]
+            k.transpose(1, 2),  # [batch, heads, seq, head_dim]
+            cos.unsqueeze(0).unsqueeze(0),  # [1, 1, seq, head_dim]
+            sin.unsqueeze(0).unsqueeze(0),  # [1, 1, seq, head_dim]
+        )
+        q = q.transpose(1, 2)  # [batch, seq, heads, head_dim]
+        k = k.transpose(1, 2)  # [batch, seq, heads, head_dim]
+        
+        # Apply Native Sparse Attention
+        output, past_key_value = self.nsa(q, k, v, attention_mask, position_ids, past_key_value)
+        
+        # Apply attention dropout
+        output = F.dropout(output, p=self.attention_dropout, training=self.training)
+        
+        return output, past_key_value
+
+class TokenTemperatureModulation(nn.Module):
+    """
+    Token Temperature Modulation (TTM) mechanism for enhancing attention to important tokens.
+    This is implemented as a helper for Multi-Head Latent Attention, not as a replacement.
+    """
+    def __init__(self, config):
+        super().__init__()
+        self.config = config
+        self.hidden_size = config.hidden_size
+        self.use_ttm = getattr(config, 'use_ttm', False)
+        
+        # Temperature calculation networks
+        self.frequency_scorer = nn.Linear(self.hidden_size, 1)
+        self.position_scorer = nn.Linear(self.hidden_size, 1)
+        self.context_scorer = nn.Linear(self.hidden_size, 1)
+        
+        # Weights for different components
+        self.alpha = getattr(config, 'ttm_alpha', 0.5)  # Frequency weight
+        self.beta = getattr(config, 'ttm_beta', 0.3)    # Position weight
+        self.gamma = getattr(config, 'ttm_gamma', 0.2)  # Context weight
+        
+        # Initialize with proper scale
+        self._init_weights()
+    
+    def _init_weights(self):
+        # Initialize with small weights to avoid disrupting attention at start
+        nn.init.normal_(self.frequency_scorer.weight, mean=0.0, std=0.02)
+        nn.init.normal_(self.position_scorer.weight, mean=0.0, std=0.02)
+        nn.init.normal_(self.context_scorer.weight, mean=0.0, std=0.02)
+        nn.init.zeros_(self.frequency_scorer.bias)
+        nn.init.zeros_(self.position_scorer.bias)
+        nn.init.zeros_(self.context_scorer.bias)
+    
+    def calculate_token_temperatures(self, hidden_states, input_ids=None):
+        """
+        Calculate temperature values for each token in the sequence.
+        
+        Args:
+            hidden_states: Tensor of shape [batch_size, seq_length, hidden_size]
+            input_ids: Optional tensor of shape [batch_size, seq_length]
+            
+        Returns:
+            temperatures: Tensor of shape [batch_size, seq_length]
+        """
+        if not self.use_ttm or not self.training:
+            # Return ones if TTM is disabled or during inference
+            return torch.ones(hidden_states.shape[0], hidden_states.shape[1], device=hidden_states.device)
+        
+        # Calculate frequency score (how common/rare a token is)
+        frequency_score = self.frequency_scorer(hidden_states).squeeze(-1)
+        
+        # Calculate position score (importance based on position)
+        position_score = self.position_scorer(hidden_states).squeeze(-1)
+        
+        # Calculate context score (importance based on surrounding context)
+        context_score = self.context_scorer(hidden_states).squeeze(-1)
+        
+        # Combine scores with learned weights
+        temperatures = (
+            self.alpha * torch.sigmoid(frequency_score) + 
+            self.beta * torch.sigmoid(position_score) + 
+            self.gamma * torch.sigmoid(context_score)
         )
         
-        input_ids = encodings["input_ids"].squeeze()
-        attention_mask = encodings["attention_mask"].squeeze()
+        # Normalize to have mean 1.0 to avoid changing overall attention scale
+        temperatures = temperatures * (temperatures.shape[1] / temperatures.sum(dim=1, keepdim=True))
         
-        # Create labels (shifted input_ids for causal language modeling)
-        labels = input_ids.clone()
-        # Mask out padding tokens in labels
-        labels[labels == self.tokenizer.pad_token_id] = -100
+        return temperatures
+    
+    def calculate_ttm_loss(self, hidden_states, labels):
+        """
+        Calculate TTM loss to encourage focus on important tokens.
+        
+        Args:
+            hidden_states: Tensor of shape [batch_size, seq_length, hidden_size]
+            labels: Tensor of shape [batch_size, seq_length]
+            
+        Returns:
+            ttm_loss: Scalar tensor
+        """
+        if not self.use_ttm or not self.training:
+            return torch.tensor(0.0, device=hidden_states.device)
+        
+        # Get token temperatures
+        temperatures = self.calculate_token_temperatures(hidden_states)
+        
+        # Calculate entropy of temperature distribution
+        # We want to minimize entropy to encourage clear focus on specific tokens
+        temperature_probs = F.softmax(temperatures, dim=-1)
+        entropy = -torch.sum(temperature_probs * torch.log(temperature_probs + 1e-10), dim=-1).mean()
+        
+        # Calculate variance of temperatures
+        # We want to maximize variance to differentiate important from unimportant tokens
+        variance = torch.var(temperatures, dim=-1).mean()
+        
+        # Combined loss: minimize entropy, maximize variance
+        ttm_loss = entropy - 0.1 * variance
+        
+        return ttm_loss
+
+class MultiTokenPrediction(nn.Module):
+    """
+    Multi-Token Prediction (MTP) head for predicting multiple tokens at once.
+    """
+    def __init__(self, config):
+        super().__init__()
+        self.config = config
+        self.hidden_size = config.hidden_size
+        self.vocab_size = config.vocab_size
+        
+        # MTP projection head
+        self.mtp_head = nn.Linear(self.hidden_size, self.vocab_size)
+        
+        # Initialize weights
+        self._init_weights()
+    
+    def _init_weights(self):
+        # Initialize with same scale as main LM head
+        nn.init.normal_(self.mtp_head.weight, mean=0.0, std=0.02)
+        if hasattr(self.mtp_head, 'bias') and self.mtp_head.bias is not None:
+            nn.init.zeros_(self.mtp_head.bias)
+    
+    def forward(self, hidden_states, attention_mask=None, labels=None):
+        """
+        Forward pass for MTP.
+        
+        Args:
+            hidden_states: Tensor of shape [batch_size, seq_length, hidden_size]
+            attention_mask: Optional attention mask
+            labels: Optional labels for loss calculation
+            
+        Returns:
+            logits: Tensor of shape [batch_size, seq_length, vocab_size]
+            loss: Optional loss if labels are provided
+        """
+        # Project hidden states to vocabulary
+        logits = self.mtp_head(hidden_states)
+        
+        # Calculate loss if labels are provided
+        loss = None
+        if labels is not None and self.training:
+            loss_fct = nn.CrossEntropyLoss()
+            loss = loss_fct(logits.view(-1, self.vocab_size), labels.view(-1))
+        
+        return logits, loss
+
+class QuasarExpertFFN(nn.Module):
+    def __init__(self, config):
+        super().__init__()
+        self.w1 = nn.Linear(config.hidden_size, config.intermediate_size)
+        self.w2 = nn.Linear(config.intermediate_size, config.hidden_size)
+        self.w3 = nn.Linear(config.hidden_size, config.intermediate_size)
+        
+    def forward(self, x):
+        # SwiGLU activation
+        return self.w2(F.silu(self.w1(x)) * self.w3(x))
+
+class QuasarMoE(nn.Module):
+    def __init__(self, config):
+        super().__init__()
+        self.hidden_size = config.hidden_size
+        self.intermediate_size = config.intermediate_size
+        
+        # MoE parameters
+        self.num_experts = getattr(config, 'num_experts', 64)  # Ne
+        self.num_shared_experts = getattr(config, 'num_shared_experts', 1)  # Ns
+        self.num_routed_experts = getattr(config, 'num_routed_experts', 64)  # Nr
+        self.top_k = getattr(config, 'top_k', 4)  # Kr
+        self.alpha = getattr(config, 'load_balancing_alpha', 0.01)  # Alpha for sequence-wise auxiliary loss
+        self.gamma = getattr(config, 'load_balancing_gamma', 0.01)  # Gamma for token-wise auxiliary loss
+        
+        # Shared experts
+        self.shared_experts = nn.ModuleList([
+            QuasarExpertFFN(config) for _ in range(self.num_shared_experts)
+        ])
+        
+        # Routed experts
+        self.routed_experts = nn.ModuleList([
+            QuasarExpertFFN(config) for _ in range(self.num_routed_experts)
+        ])
+        
+        # Router
+        self.router = nn.Linear(self.hidden_size, self.num_routed_experts)
+        self.expert_biases = nn.Parameter(torch.zeros(self.num_routed_experts))
+        # gamma is already defined above
+        
+    def forward(self, x, update_biases=True):
+        batch_size, seq_len = x.shape[:2]
+        
+        # Get router scores and add biases
+        router_logits = self.router(x)  # [batch, seq, Nr]
+        router_logits_with_bias = router_logits + self.expert_biases
+        
+        # Get top-K experts and their scores
+        scores_with_bias, indices = torch.topk(router_logits_with_bias, self.top_k, dim=-1)  # [batch, seq, Kr]
+        
+        # Get original scores for selected experts (without bias)
+        # This is important: route based on s_i,t + bi but compute gates using original s_i,t
+        original_scores = torch.gather(router_logits, -1, indices)
+        
+        # Apply sigmoid to get affinity scores
+        scores = torch.sigmoid(original_scores)  # Original scores for gates
+        gates = F.normalize(scores, p=1, dim=-1)  # Normalize for weighted sum
+        
+        # Process with shared experts
+        shared_output = torch.zeros_like(x)
+        for i in range(self.num_shared_experts):
+            shared_output += self.shared_experts[i](x)
+        shared_output /= self.num_shared_experts
+        
+        # Process with routed experts - use a deterministic approach for gradient checkpointing
+        routed_output = torch.zeros_like(x)
+        
+        # Deterministic processing of experts
+        # This approach ensures the same number of tensors are created during forward and recomputation
+        for k in range(self.top_k):
+            expert_idx = indices[..., k]
+            gate = gates[..., k:k+1]
+            
+            # Create a flattened version for processing
+            flat_x = x.reshape(-1, x.size(-1))
+            flat_expert_idx = expert_idx.reshape(-1)
+            flat_gate = gate.reshape(-1, 1)
+            
+            # Process each expert in a deterministic way
+            for i in range(self.num_routed_experts):
+                # Create binary mask for this expert
+                expert_mask = (flat_expert_idx == i)
+                # Apply the mask to get inputs for this expert
+                # Convert mask to same dtype as x to avoid dtype mismatch
+                mask_tensor = expert_mask.unsqueeze(-1).to(dtype=x.dtype)
+                masked_input = flat_x * mask_tensor
+                # Process all inputs (most will be zeros)
+                expert_output = self.routed_experts[i](masked_input)
+                # Apply gate values (also masked)
+                gated_output = expert_output * (flat_gate * mask_tensor)
+                # Add to the output
+                routed_output += gated_output.reshape(x.shape)
+        
+        # Combine outputs
+        output = shared_output + routed_output
+        
+        # Update biases based on expert load - only during training
+        if update_biases and self.training:
+            # Calculate expert counts for batch-wise load balancing
+            expert_counts = torch.zeros(self.num_routed_experts, device=x.device, dtype=x.dtype)
+            
+            # Deterministic approach to count experts
+            flat_indices = indices.reshape(-1)
+            for i in range(self.num_routed_experts):
+                expert_counts[i] = (flat_indices == i).to(dtype=x.dtype).sum()
+                    
+            target_count = (batch_size * seq_len * self.top_k) / self.num_routed_experts
+            load_diff = expert_counts - target_count
+            
+            # Update biases
+            with torch.no_grad():
+                self.expert_biases.data -= self.gamma * load_diff.to(self.expert_biases.dtype)
+            
+            # Compute sequence-wise auxiliary loss (L_Bal) - deterministic approach
+            sequence_counts = torch.zeros(batch_size, self.num_routed_experts, device=x.device, dtype=x.dtype)
+            
+            # Reshape indices to [batch, seq*top_k] for deterministic processing
+            reshaped_indices = indices.reshape(batch_size, -1)
+            for i in range(self.num_routed_experts):
+                sequence_counts[:, i] = (reshaped_indices == i).to(dtype=x.dtype).sum(dim=1)
+            
+            # Compute sequence-wise auxiliary loss (L_Bal)
+            sequence_fractions = sequence_counts / (seq_len * self.top_k)
+            target_fraction = 1.0 / self.num_routed_experts
+            target_tensor = torch.full_like(sequence_fractions, target_fraction)
+            sequence_loss = F.mse_loss(sequence_fractions, target_tensor)
+            
+            # Store the loss for later use in the training objective
+            self.sequence_balance_loss = self.alpha * sequence_loss
+        else:
+            self.sequence_balance_loss = 0.0
+        
+        return output
+
+class QuasarTransformerBlock(nn.Module):
+    def __init__(self, config, layer_idx=None):
+        super().__init__()
+        self.layer_idx = layer_idx
+        self.config = config
+        
+        # Memory-efficient initialization
+        self._initialize_memory_efficient = True
+        
+        # Pre-normalization for attention
+        self.pre_attention_norm = RMSNorm(config.hidden_size, eps=config.layer_norm_epsilon)
+        
+        # Attention mechanism (MLA or NSA)
+        if config.use_nsa:
+            self.attention = NSAAttention(config)
+        else:
+            self.attention = MultiHeadLatentAttention(config)
+        
+        # Post-attention normalization
+        self.post_attention_norm = RMSNorm(config.hidden_size, eps=config.layer_norm_epsilon)
+        
+        # Feed-forward network (standard or MoE)
+        use_moe_for_this_layer = config.use_moe and (self.layer_idx > 0 or not config.first_layer_no_moe)
+        
+        if use_moe_for_this_layer:
+            self.ffn = QuasarMoE(config)
+        else:
+            self.ffn = QuasarExpertFFN(config)
+        
+        # Dropout for regularization
+        self.dropout = nn.Dropout(config.hidden_dropout_prob)
+        
+    def forward(self, hidden_states, attention_mask=None, past_key_value=None, position_ids=None, token_temperatures=None):
+        # Pre-norm for attention
+        normed_states = self.pre_attention_norm(hidden_states)
+        
+        # Apply attention with MLA as the main mechanism, TTM just passes token temperatures
+        attention_output, past_key_value = self.attention(
+            normed_states,
+            attention_mask=attention_mask,
+            past_key_value=past_key_value,
+            position_ids=position_ids,
+            token_temperatures=token_temperatures  # Just pass token temperatures, MLA decides how to use them
+        )
+        hidden_states = hidden_states + self.dropout(attention_output)
+        
+        # Pre-norm for FFN/MoE
+        normed_states = self.post_attention_norm(hidden_states)
+        ffn_output = self.ffn(normed_states)
+        hidden_states = hidden_states + self.dropout(ffn_output)
+        
+        return hidden_states, past_key_value
+
+class QuasarConfig:
+    def __init__(
+        self,
+        vocab_size=102400,  # DeepSeek
+        hidden_size=2048,   # DeepSeek (dim)
+        num_hidden_layers=20,  # DeepSeek (n_layers)
+        num_attention_heads=128,  # DeepSeek (n_heads)
+        head_dim=128,  # Keep as is unless you want v_head_dim=128
+        intermediate_size=4096,  # DeepSeek (inter_dim)
+        kv_compressed_dim=256,
+        query_compressed_dim=512,
+        rope_dim_per_head=32,
+        max_position_embeddings=4096,  # Keep as is
+        attention_dropout_prob=0.0,
+        hidden_dropout_prob=0.0,
+        layer_norm_epsilon=1e-5,
+        initializer_range=0.02,
+        use_cache=True,
+        pad_token_id=0,
+        bos_token_id=1,
+        eos_token_id=2,
+        tie_word_embeddings=True,
+        use_moe=True,
+        num_experts=11,  # 2 shared + 64 routed
+        num_experts_per_token=2,  # Keep as is
+        moe_balance_loss_weight=0.01,
+        first_layer_no_moe=True,
+        num_shared_experts=1,  # DeepSeek
+        num_routed_experts=10,  # DeepSeek
+        top_k=6,  # Reduced from 6 to prevent CUDA indexing errors
+        load_balancing_alpha=0.01,
+        load_balancing_gamma=0.01,
+        use_ttm=False,  # Temporarily disabled to prevent CUDA memory errors
+        ttm_loss_weight=0.01,
+        mtp_loss_weight=0.1,
+        use_mtp=True,
+        use_rope=True,
+        use_nsa=False,
+        **kwargs
+    ):
+        self.vocab_size = vocab_size
+        self.hidden_size = hidden_size
+        self.num_hidden_layers = num_hidden_layers
+        self.num_attention_heads = num_attention_heads
+        self.head_dim = head_dim
+        self.intermediate_size = intermediate_size
+        self.kv_compressed_dim = kv_compressed_dim
+        self.query_compressed_dim = query_compressed_dim
+        self.rope_dim_per_head = rope_dim_per_head
+        self.max_position_embeddings = max_position_embeddings
+        self.attention_dropout_prob = attention_dropout_prob
+        self.hidden_dropout_prob = hidden_dropout_prob
+        self.layer_norm_epsilon = layer_norm_epsilon
+        self.initializer_range = initializer_range
+        self.use_cache = use_cache
+        self.pad_token_id = pad_token_id
+        self.bos_token_id = bos_token_id
+        self.eos_token_id = eos_token_id
+        self.tie_word_embeddings = tie_word_embeddings
+        self.use_moe = use_moe
+        self.num_experts = num_experts
+        self.num_experts_per_token = num_experts_per_token
+        self.moe_balance_loss_weight = moe_balance_loss_weight
+        self.first_layer_no_moe = first_layer_no_moe
+        self.num_shared_experts = num_shared_experts
+        self.num_routed_experts = num_routed_experts
+        self.top_k = top_k
+        self.load_balancing_alpha = load_balancing_alpha
+        self.load_balancing_gamma = load_balancing_gamma
+        self.use_ttm = use_ttm
+        self.ttm_loss_weight = ttm_loss_weight
+        self.mtp_loss_weight = mtp_loss_weight
+        self.use_mtp = use_mtp
+        self.use_nsa = use_nsa
+        
+        # Process any additional kwargs
+        for key, value in kwargs.items():
+            setattr(self, key, value)
+
+class Quasar(nn.Module):
+    def __init__(self, config, pbar=None, use_meta_device=False, ultra_lazy=False, distributed_init=False, rank=0, world_size=1):
+        super().__init__()
+        self.config = config
+        
+        # For very large models, we'll use DeepSpeed's initialization
+        # This just creates the structure without allocating memory
+        self.use_meta_device = use_meta_device
+        self.ultra_lazy = ultra_lazy
+        self.distributed_init = distributed_init
+        self.rank = rank
+        self.world_size = world_size
+        
+        if pbar:
+            pbar.update(5)
+            pbar.set_description("Creating token embeddings")
+        
+        # Token embeddings
+        self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size)
+        
+        # Embedding dropout
+        self.embedding_dropout = nn.Dropout(config.hidden_dropout_prob)
+        
+        # Main transformer layers
+        self.layers = nn.ModuleList([])
+        total_layers = config.num_hidden_layers
+        
+        # This is the most time-consuming part, so we track progress here
+        for i in range(total_layers):
+            if pbar:
+                # Update progress proportionally (70% of total progress)
+                progress_per_layer = 70.0 / total_layers
+                pbar.update(progress_per_layer)
+                pbar.set_description(f"Creating transformer layer {i+1}/{total_layers}")
+            
+            # Memory-efficient initialization - clear CUDA cache after each layer
+            layer = QuasarTransformerBlock(config, layer_idx=i)
+            self.layers.append(layer)
+            
+            # Clear CUDA cache to prevent OOM errors during initialization
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+        
+        # Final layer norm
+        self.final_norm = RMSNorm(config.hidden_size)
+        
+        if pbar:
+            pbar.update(5)
+            pbar.set_description("Creating output projection")
+            
+        # Output projection
+        self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
+        self.lm_head.weight = self.embed_tokens.weight  # Weight tying
+        
+        # Multi-token prediction module
+        self.mtp = MultiTokenPrediction(config)
+        
+        # Token Temperature Modulation (TTM) module
+        if config.use_ttm:
+            self.ttm = TokenTemperatureModulation(config)
+        
+        # Gradient checkpointing flag
+        self.gradient_checkpointing = False
+        
+        self.apply(self._init_weights)
+        
+    def _init_weights(self, module):
+        if isinstance(module, nn.Linear):
+            module.weight.data.normal_(mean=0.0, std=self.config.initializer_range)
+            if module.bias is not None:
+                module.bias.data.zero_()
+                
+    def gradient_checkpointing_enable(self):
+        """Enable gradient checkpointing for memory-efficient training."""
+        self.gradient_checkpointing = True
+    
+    def gradient_checkpointing_disable(self):
+        """Disable gradient checkpointing."""
+        self.gradient_checkpointing = False
+        
+    def forward(self, input_ids, attention_mask=None, past_key_values=None, labels=None, position_ids=None):
+        batch_size, seq_length = input_ids.shape
+        
+        # Create attention mask if not provided
+        if attention_mask is None:
+            # Create attention mask based on pad_token_id
+            attention_mask = torch.ones_like(input_ids)
+            if self.config.pad_token_id is not None:
+                attention_mask = (input_ids != self.config.pad_token_id).long()
+        
+        # Initialize position_ids if not provided
+        if position_ids is None:
+            # Create position ids based on attention mask
+            position_ids = torch.cumsum(attention_mask, dim=1) - 1
+            # Set position ids for padding tokens to 0
+            position_ids = position_ids * attention_mask
+            position_ids = position_ids.to(input_ids.device)
+        
+        # Get input embeddings
+        hidden_states = self.embed_tokens(input_ids)
+        hidden_states = self.embedding_dropout(hidden_states)
+        
+        # Initialize past_key_values if None
+        if past_key_values is None:
+            past_key_values = tuple([None] * len(self.layers))
+            
+        # Calculate token temperatures for TTM if enabled
+        token_temperatures = None
+        if hasattr(self, 'ttm') and labels is not None:
+            token_temperatures = self.ttm.calculate_token_temperatures(hidden_states, input_ids)
+        
+        # Process through transformer layers
+        all_hidden_states = []
+        new_past_key_values = []
+        moe_balance_loss = 0.0
+        
+        for i, (layer, past_key_value) in enumerate(zip(self.layers, past_key_values)):
+            all_hidden_states.append(hidden_states)
+            
+            if self.gradient_checkpointing and self.training:
+                # Use gradient checkpointing for memory efficiency
+                def create_custom_forward(module):
+                    def custom_forward(*inputs):
+                        return module(*inputs)
+                    return custom_forward
+                
+                layer_outputs = torch.utils.checkpoint.checkpoint(
+                    create_custom_forward(layer),
+                    hidden_states, 
+                    attention_mask, 
+                    past_key_value, 
+                    position_ids,
+                    token_temperatures,
+                    use_reentrant=False  # Set to False as recommended
+                )
+            else:
+                layer_outputs = layer(
+                    hidden_states,
+                    attention_mask=attention_mask,
+                    past_key_value=past_key_value,
+                    position_ids=position_ids,
+                    token_temperatures=token_temperatures
+                )
+            
+            hidden_states, past_key_value = layer_outputs
+            new_past_key_values.append(past_key_value)
+            
+            # Accumulate MoE balance loss if available
+            if hasattr(layer, 'ffn') and hasattr(layer.ffn, 'sequence_balance_loss'):
+                moe_balance_loss += layer.ffn.sequence_balance_loss
+        
+        # Final normalization
+        hidden_states = self.final_norm(hidden_states)
+        all_hidden_states.append(hidden_states)
+        
+        # Calculate main loss (next token prediction)
+        main_logits = self.lm_head(hidden_states)
+        main_loss = None
+        if labels is not None:
+            # Shift so that tokens < n predict n
+            shift_logits = main_logits[..., :-1, :].contiguous()
+            shift_labels = labels[..., 1:].contiguous()
+            # Flatten the tokens
+            loss_fct = nn.CrossEntropyLoss()
+            main_loss = loss_fct(shift_logits.view(-1, self.config.vocab_size), shift_labels.view(-1))
+        
+        # Calculate multi-token prediction loss if enabled
+        mtp_loss = None
+        if hasattr(self, 'mtp') and self.training and getattr(self.config, 'use_mtp', False):
+            mtp_logits, mtp_loss = self.mtp(hidden_states, attention_mask, labels)
+        
+        # Calculate TTM loss if enabled
+        ttm_loss = None
+        if hasattr(self, 'ttm') and self.ttm.use_ttm and labels is not None:
+            ttm_loss = self.ttm.calculate_ttm_loss(hidden_states, labels)
+        
+        # Combine losses
+        loss = None
+        if main_loss is not None:
+            loss = main_loss
+            
+            if mtp_loss is not None:
+                loss += self.config.mtp_loss_weight * mtp_loss
+                
+            if moe_balance_loss > 0:
+                loss += self.config.moe_balance_loss_weight * moe_balance_loss
+                
+            if ttm_loss is not None:
+                loss += self.config.ttm_loss_weight * ttm_loss
         
         return {
-            "input_ids": input_ids,
-            "attention_mask": attention_mask,
-            "labels": labels
+            'main_logits': main_logits,
+            'loss': loss,
+            'main_loss': main_loss,
+            'mtp_loss': mtp_loss,
+            'moe_balance_loss': moe_balance_loss,
+            'ttm_loss': ttm_loss,
+            'hidden_states': hidden_states,
+            'past_key_values': tuple(new_past_key_values) if new_past_key_values else None
         }
 
-def setup_distributed(rank, world_size):
-    """Initialize the distributed environment."""
-    os.environ['MASTER_ADDR'] = 'localhost'
-    os.environ['MASTER_PORT'] = '12355'
-    dist.init_process_group("nccl", rank=rank, world_size=world_size)
-    torch.cuda.set_device(rank)
-
-def cleanup_distributed():
-    """Clean up the distributed environment."""
-    dist.destroy_process_group()
-
-def get_parameter_count(model):
-    """Calculate the number of parameters in the model."""
-    return sum(p.numel() for p in model.parameters())
-
-def train(args, rank, world_size):
-    """Train the model."""
-    # Set device
-    if torch.cuda.is_available():
-        device = torch.device(f"cuda:{rank}")
-    else:
-        device = torch.device("cpu")
+def create_quasar_model(use_nsa=False, pbar=None, lazy_init=True, ultra_lazy=True, distributed_init=True):
+    """Create a ~200B parameter Quasar model with ~17B active parameters through MoE.
     
-    # Only log from the main process
-    should_log = is_main_process(rank)
-    
-    # Set random seeds for reproducibility
-    torch.manual_seed(args.seed)
-    np.random.seed(args.seed)
-    
-    # Initialize wandb for tracking experiments
-    if should_log and args.use_wandb:
-        # Only initialize wandb on the main process (rank 0)
-        if int(os.environ.get("LOCAL_RANK", "-1")) != 0:
-            os.environ["WANDB_MODE"] = "disabled"
-        else:
-            wandb.init(
-                project="quasar-pretrain",
-                config=vars(args),
-                name=args.run_name,
-                tags=["quasar3", f"bs{args.batch_size}", f"lr{args.learning_rate}", 
-                      f"precision-{args.precision}", "deepspeed" if args.deepspeed else "standard"]
-            )
-    
-    # Load custom tokenizer from tokenizer.json
-    if should_log:
-        logger.info(f"Loading tokenizer from {args.tokenizer_path}")
-    tokenizer = PreTrainedTokenizerFast(tokenizer_file=args.tokenizer_path)
-    
-    # Set special tokens
-    tokenizer.bos_token = "<｜begin▁of▁sentence｜>"
-    tokenizer.eos_token = "<｜end▁of▁sentence｜>"
-    tokenizer.pad_token = "<｜▁pad▁｜>"
-    tokenizer.unk_token = "<｜▁unk▁｜>"
-    
-    # Create datasets and dataloaders
-    train_dataset = MultiDataset(
-        tokenizer=tokenizer,
-        split="train",
-        max_length=args.max_seq_length,
-        cache_dir=args.cache_dir,
-    )
-    
-    # Load a specific validation dataset
-    val_dataset = None
-    try:
-        if should_log:
-            logger.info("Loading specific validation dataset: Jackmin108/c4-en-validation-mini")
-        # Create a simple validation dataset class that only loads the validation data
-        class ValidationDataset(Dataset):
-            def __init__(self, tokenizer, max_length=8129, cache_dir=None):
-                self.tokenizer = tokenizer
-                self.max_length = max_length
-                # Load the specific validation dataset
-                self.dataset = load_dataset("Jackmin108/c4-en-validation-mini", split="validation", cache_dir=cache_dir)
-                logger.info(f"Loaded validation dataset with {len(self.dataset)} examples")
-                
-            def __len__(self):
-                return len(self.dataset)
-                
-            def __getitem__(self, idx):
-                # Get text from the validation dataset
-                if "text" in self.dataset[idx]:
-                    text = self.dataset[idx]["text"]
-                else:
-                    # Fallback for other field names
-                    for key, value in self.dataset[idx].items():
-                        if isinstance(value, str) and len(value) > 0:
-                            text = value
-                            break
-                    else:
-                        text = "Validation example."
-                
-                # Tokenize text
-                encodings = self.tokenizer(
-                    text,
-                    max_length=self.max_length,
-                    truncation=True,
-                    padding="max_length",
-                    return_tensors="pt"
-                )
-                
-                input_ids = encodings["input_ids"].squeeze()
-                attention_mask = encodings["attention_mask"].squeeze()
-                
-                # Create labels (shifted input_ids for causal language modeling)
-                labels = input_ids.clone()
-                # Mask out padding tokens in labels
-                labels[labels == self.tokenizer.pad_token_id] = -100
-                
-                return {
-                    "input_ids": input_ids,
-                    "attention_mask": attention_mask,
-                    "labels": labels
-                }
-        
-        # Create the validation dataset
-        val_dataset = ValidationDataset(
-            tokenizer=tokenizer,
-            max_length=args.max_seq_length,
-            cache_dir=args.cache_dir,
-        )
-        if should_log:
-            logger.info(f"Successfully loaded validation dataset with {len(val_dataset)} examples")
-    except Exception as e:
-        if should_log:
-            logger.warning(f"Failed to load validation dataset: {e}")
-            logger.info("Training will continue without validation")
-        val_dataset = None  # Ensure it's None even if partially initialized
-    
-    # Setup samplers for distributed training
-    if args.distributed and not args.deepspeed:
-        train_sampler = DistributedSampler(train_dataset)
-        val_sampler = DistributedSampler(val_dataset, shuffle=False) if val_dataset else None
-    else:
-        train_sampler = None
-        val_sampler = None
-    
-    train_loader = DataLoader(
-        train_dataset,
-        batch_size=args.batch_size,
-        sampler=train_sampler,
-        num_workers=args.num_workers,
-        pin_memory=True,
-        persistent_workers=True if args.num_workers > 0 else False
-    )
-    
-    # Only create validation dataloader if validation dataset exists
-    val_loader = None
-    if val_dataset is not None and hasattr(val_dataset, 'dataset') and val_dataset.dataset is not None:
-        val_loader = DataLoader(
-            val_dataset,
-            batch_size=args.batch_size,
-            sampler=val_sampler,
-            num_workers=args.num_workers,
-            pin_memory=True,
-            persistent_workers=True if args.num_workers > 0 else False
-        )
-    
-    # Create model
-    if should_log:
-        logger.info("Creating Quasar model...")
-    from tqdm import tqdm
-    import time
-    
-    # Show loading bar for model creation with time estimation
+    Args:
+        use_nsa: Whether to use Native Sparse Attention instead of Multi-Head Latent Attention.
+        pbar: Optional progress bar for tracking model creation.
+        lazy_init: Whether to use lazy initialization to reduce memory usage during creation.
+        ultra_lazy: Whether to use ultra-lazy initialization for extremely large models (200B+).
+        distributed_init: Whether to use distributed initialization for multi-GPU setups.
+    """
+    # Start timing for more accurate progress estimation
     start_time = time.time()
-    
-    # Estimate total time based on model size (rough estimate)
-    hidden_size = QuasarConfig().hidden_size
-    num_layers = QuasarConfig().num_hidden_layers
-    num_experts = QuasarConfig().num_routed_experts + QuasarConfig().num_shared_experts
-    
-    # Rough time estimate in seconds based on model size
-    estimated_time = (hidden_size * num_layers * num_experts) / 1000000
     
     # Set memory-efficient initialization
-    if should_log:
-        logger.info("Using ULTRA-LAZY initialization to prevent OOM errors for 200B+ parameter models")
-        logger.info(f"Model config: {hidden_size} hidden size, {num_layers} layers, {num_experts} experts")
-        logger.info("Note: Parameters will be initialized by DeepSpeed during model distribution")
+    torch.backends.cudnn.benchmark = False
+    torch.backends.cuda.matmul.allow_tf32 = True
     
-    # Free up memory before starting
+    # Try to free up memory before starting
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
-        # Set to lowest memory usage
-        torch.cuda.set_per_process_memory_fraction(0.8)  # Reserve some memory for system
+        # Set memory fraction to prevent OOM
+        torch.cuda.set_per_process_memory_fraction(0.9)
     
-    with tqdm(total=100, desc="Creating Quasar model", ncols=100, 
-              bar_format='{l_bar}{bar}| {n:.0f}/{total:.0f} [{elapsed}<{remaining}, {rate_fmt}]') as pbar:
+    if pbar:
+        pbar.update(5)
+        pbar.set_description("Initializing model configuration")
+    
+    config = QuasarConfig()
+    config.use_nsa = use_nsa
+    
+    # Check if we're in a distributed environment
+    is_distributed = torch.distributed.is_available() and torch.distributed.is_initialized()
+    
+    # For multi-GPU distributed initialization of extremely large models
+    if distributed_init and is_distributed:
+        if pbar:
+            pbar.update(15)
+            pbar.set_description("Using distributed initialization for multi-GPU setup")
         
-        # Create model with ultra-lazy initialization to prevent OOM errors
-        model = create_quasar_model(
-            use_nsa=args.use_nsa, 
-            pbar=pbar, 
-            lazy_init=True,  # Use lazy initialization for large models
-            ultra_lazy=True  # Use ultra-lazy initialization for 200B+ models
-        )
+        # Get distributed info
+        world_size = torch.distributed.get_world_size()
+        rank = torch.distributed.get_rank()
         
+        if pbar and rank == 0:
+            pbar.set_description(f"Distributed init across {world_size} GPUs (rank {rank})")
+        
+        # Calculate parameter counts analytically without creating any model
+        hidden_size = config.hidden_size
+        num_layers = config.num_hidden_layers
+        num_heads = config.num_attention_heads
+        vocab_size = config.vocab_size
+        ffn_dim = config.intermediate_size
+        num_shared = config.num_shared_experts
+        num_routed = config.num_routed_experts
+        top_k = config.top_k
+        
+        # Embedding parameters
+        embed_params = vocab_size * hidden_size
+        
+        # Attention parameters per layer
+        attn_params = 4 * hidden_size * hidden_size  # Q, K, V, O projections
+        
+        # FFN parameters per expert
+        ffn_params = 3 * hidden_size * ffn_dim  # Up, Gate, Down projections
+        
+        # Layer norm parameters
+        ln_params = 2 * hidden_size * num_layers
+        
+        # MoE parameters
+        moe_params = ffn_params * (num_shared + num_routed)
+        
+        # Total parameters
+        param_count = embed_params + (attn_params * num_layers) + (moe_params * num_layers) + ln_params
+        
+        # Active parameters
+        shared_expert_params = param_count * (num_shared / (num_shared + num_routed))
+        routed_expert_params = param_count * (num_routed / (num_shared + num_routed))
+        active_param_count = shared_expert_params + (routed_expert_params * (top_k / num_routed))
+        
+        # Calculate per-GPU parameters (for ZeRO-3)
+        per_gpu_params = param_count / world_size
+        
+        if pbar and rank == 0:
+            pbar.update(25)
+            pbar.set_description(f"Estimated {param_count/1e9:.2f}B params ({per_gpu_params/1e9:.2f}B per GPU)")
+        
+        # Synchronize all processes before creating model
+        torch.distributed.barrier()
+        
+        # Create empty model shell - DeepSpeed will handle parameter initialization
+        model = Quasar(config, distributed_init=True, rank=rank, world_size=world_size)
+        
+        if pbar and rank == 0:
+            pbar.update(50)
+            pbar.set_description("Model structure created, waiting for DeepSpeed init")
+    
+    # For extremely large models (200B+) on single GPU, use ultra-lazy initialization
+    elif ultra_lazy:
+        if pbar:
+            pbar.update(15)
+            pbar.set_description("Using ultra-lazy initialization for 200B+ model")
+        
+        # Calculate parameter counts analytically without creating any model
+        hidden_size = config.hidden_size
+        num_layers = config.num_hidden_layers
+        num_heads = config.num_attention_heads
+        vocab_size = config.vocab_size
+        ffn_dim = config.intermediate_size
+        num_shared = config.num_shared_experts
+        num_routed = config.num_routed_experts
+        top_k = config.top_k
+        
+        # Embedding parameters
+        embed_params = vocab_size * hidden_size
+        
+        # Attention parameters per layer
+        attn_params = 4 * hidden_size * hidden_size  # Q, K, V, O projections
+        
+        # FFN parameters per expert
+        ffn_params = 3 * hidden_size * ffn_dim  # Up, Gate, Down projections
+        
+        # Layer norm parameters
+        ln_params = 2 * hidden_size * num_layers
+        
+        # MoE parameters
+        moe_params = ffn_params * (num_shared + num_routed)
+        
+        # Total parameters
+        param_count = embed_params + (attn_params * num_layers) + (moe_params * num_layers) + ln_params
+        
+        # Active parameters
+        shared_expert_params = param_count * (num_shared / (num_shared + num_routed))
+        routed_expert_params = param_count * (num_routed / (num_shared + num_routed))
+        active_param_count = shared_expert_params + (routed_expert_params * (top_k / num_routed))
+        
+        if pbar:
+            pbar.update(75)
+            pbar.set_description("Creating model structure (ultra-lazy)")
+        
+        # Create a minimal model structure for DeepSpeed
+        # This is just a skeleton - DeepSpeed will handle the actual initialization
+        model = Quasar(config, ultra_lazy=True)
+        
+    elif lazy_init:
+        # For large models, use standard lazy initialization
+        if pbar:
+            pbar.update(10)
+            pbar.set_description("Creating model skeleton (lazy initialization)")
+        
+        # Just create a minimal model for parameter counting
+        # Actual parameters will be initialized by DeepSpeed
+        config.num_hidden_layers = 2  # Temporarily reduce layers for counting
+        temp_model = Quasar(config)
+        
+        # Estimate parameter count based on reduced model
+        temp_param_count = sum(p.numel() for p in temp_model.parameters())
+        # Scale up to full model size
+        full_layers = QuasarConfig().num_hidden_layers
+        param_count = temp_param_count * (full_layers / 2)
+        
+        # Calculate active parameters more accurately
+        shared_expert_params = param_count * (config.num_shared_experts / (config.num_shared_experts + config.num_routed_experts))
+        routed_expert_params = param_count * (config.num_routed_experts / (config.num_shared_experts + config.num_routed_experts))
+        active_param_count = shared_expert_params + (routed_expert_params * (config.top_k / config.num_routed_experts))
+        
+        if pbar:
+            pbar.update(80)
+            pbar.set_description("Creating full model (lazy initialization)")
+        
+        # Delete temporary model to free memory
+        del temp_model
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        
+        # Restore full layer count for actual model creation
+        config = QuasarConfig()
+        config.use_nsa = use_nsa
+        
+        # Create actual model (DeepSpeed will handle memory-efficient initialization)
+        model = Quasar(config)
+    else:
+        # Standard initialization (may cause OOM for very large models)
+        model = Quasar(config, pbar=pbar)
+    
+    # Calculate and print parameter count
+    if pbar:
+        pbar.update(5)
+        pbar.set_description("Calculating parameter counts")
+        
+    param_count = sum(p.numel() for p in model.parameters())
+    
+    # Calculate active parameters more accurately
+    # For each token, we use all shared experts + top_k routed experts
+    shared_expert_params = param_count * (config.num_shared_experts / (config.num_shared_experts + config.num_routed_experts))
+    routed_expert_params = param_count * (config.num_routed_experts / (config.num_shared_experts + config.num_routed_experts))
+    active_param_count = shared_expert_params + (routed_expert_params * (config.top_k / config.num_routed_experts))
+    
+    if pbar:
         # Ensure we reach 100%
-        if pbar.n < 100:
-            pbar.update(100 - pbar.n)
+        remaining = max(0, 100 - pbar.n)
+        if remaining > 0:
+            pbar.update(remaining)
+        pbar.set_description("Model creation complete")
     
-    # Log the actual time taken
-    creation_time = time.time() - start_time
-    if should_log:
-        logger.info(f"Model creation completed in {creation_time:.2f} seconds")
+    print(f"Model created with {param_count/1e9:.2f}B total parameters")
+    print(f"Approximately {active_param_count/1e9:.2f}B active parameters per token")
+    print(f"Using {'Native Sparse Attention' if use_nsa else 'Multi-Head Latent Attention'}")
+    print(f"MoE configuration: {config.num_shared_experts} shared + {config.num_routed_experts} routed experts, top-{config.top_k} routing")
+    print(f"Model dimensions: hidden_size={config.hidden_size}, layers={config.num_hidden_layers}, heads={config.num_attention_heads}")
     
-    # Enable gradient checkpointing if requested
-    if args.gradient_checkpointing:
-        if should_log:
-            logger.info("Enabling gradient checkpointing to save memory")
-        model.gradient_checkpointing_enable()
-    
-    # Log parameter count
-    param_count = get_parameter_count(model)
-    if should_log:
-        logger.info(f"Model created with {param_count/1e9:.2f}B parameters")
-    
-    # Setup optimizer parameters
-    optimizer_params = {
-        "lr": args.learning_rate,
-        "weight_decay": args.weight_decay,
-        "betas": (args.adam_beta1, args.adam_beta2),
-        "eps": args.adam_epsilon
-    }
-    
-    # Calculate total training steps
-    total_steps = len(train_loader) * args.num_epochs
-    if hasattr(args, 'warmup_steps') and args.warmup_steps > 0:
-        warmup_steps = args.warmup_steps
-    else:
-        warmup_steps = int(total_steps * args.warmup_ratio)
-    
-    # DeepSpeed integration
-    if args.deepspeed and DEEPSPEED_AVAILABLE:
-        if should_log:
-            logger.info("Initializing DeepSpeed for data parallel training...")
-            
-            # Log GPU information
-            gpu_count = torch.cuda.device_count()
-            logger.info(f"Found {gpu_count} GPUs for training")
-            for i in range(gpu_count):
-                logger.info(f"GPU {i}: {torch.cuda.get_device_name(i)}")
-            
-        # Load DeepSpeed config
-        ds_config = None
-        if os.path.exists(args.deepspeed_config):
-            with open(args.deepspeed_config, 'r') as f:
-                ds_config = json.load(f)
-                if should_log:
-                    logger.info(f"Loaded DeepSpeed config from {args.deepspeed_config}")
-        else:
-            if should_log:
-                logger.warning(f"DeepSpeed config file {args.deepspeed_config} not found. Using default config.")
-            # Calculate batch sizes properly to avoid DeepSpeed assertion errors
-            micro_batch = args.batch_size
-            grad_accum = args.gradient_accumulation_steps
-            train_batch = micro_batch * grad_accum * world_size
-            
-            ds_config = {
-                "train_batch_size": train_batch,
-                "train_micro_batch_size_per_gpu": micro_batch,
-                "gradient_accumulation_steps": grad_accum,
-                "optimizer": {
-                    "type": args.optimizer.capitalize(),
-                    "params": optimizer_params
-                },
-                "fp16": {
-                    "enabled": args.precision == "fp16" and args.precision != "bf16"
-                },
-                "bf16": {
-                    "enabled": args.precision == "bf16" and args.precision != "fp16"
-                },
-                "scheduler": {
-                    "type": "WarmupDecayLR",
-                    "params": {
-                        "warmup_min_lr": 0,
-                        "warmup_max_lr": args.learning_rate,
-                        "warmup_num_steps": warmup_steps,
-                        "total_num_steps": total_steps
-                    }
-                },
-                "zero_optimization": {
-                    "stage": 2,  # Using stage 2 for better balance of memory and performance
-                    "offload_optimizer": {
-                        "device": "cpu"
-                    },
-                    "overlap_comm": True,
-                    "contiguous_gradients": True,
-                    "reduce_bucket_size": 5e8
-                },
-                "steps_per_print": args.logging_steps,
-                "wall_clock_breakdown": False
-            }
-        
-        # Ensure DeepSpeed config has proper data parallelism settings
-        if "data_parallel_size" not in ds_config:
-            ds_config["data_parallel_size"] = world_size
-        
-        # Ensure proper precision settings
-        if args.precision == "bf16":
-            ds_config["bf16"] = {"enabled": True}
-            if "fp16" in ds_config:
-                ds_config["fp16"]["enabled"] = False
-        elif args.precision == "fp16":
-            ds_config["fp16"] = {"enabled": True}
-            if "bf16" in ds_config:
-                ds_config["bf16"]["enabled"] = False
-        
-        # Modify DeepSpeed config to ensure proper warmup
-        if 'scheduler' not in ds_config or ds_config['scheduler'] is None:
-            ds_config['scheduler'] = {
-                'type': 'WarmupLR',
-                'params': {
-                    'warmup_min_lr': 0,
-                    'warmup_max_lr': args.learning_rate,
-                    'warmup_num_steps': args.warmup_steps
-                }
-            }
-        
-        # Make sure optimizer config is properly set
-        if 'optimizer' not in ds_config or ds_config['optimizer'] is None:
-            ds_config['optimizer'] = {
-                'type': 'AdamW',
-                'params': {
-                    'lr': args.learning_rate,
-                    'betas': [args.adam_beta1, args.adam_beta2],
-                    'eps': args.adam_epsilon,
-                    'weight_decay': args.weight_decay
-                }
-            }
-        
-        # Move model to GPU before DeepSpeed initialization
-        device = torch.device("cuda", rank) if torch.cuda.is_available() else torch.device("cpu")
-        model = model.to(device)
-        
-        # Initialize DeepSpeed
-        model, optimizer, _, scheduler = deepspeed.initialize(
-            model=model,
-            model_parameters=model.parameters(),
-            config=ds_config,
-            dist_init_required=True
-        )
-        
-        if should_log:
-            logger.info(f"DeepSpeed initialized with config: {json.dumps(ds_config, indent=2)}")
-            logger.info(f"All {world_size} GPUs will work on the same task using data parallelism")
-    else:
-        # Standard training setup (non-DeepSpeed)
-        # Move model to GPU and setup DDP if needed
-        model = model.to(device)
-        if args.distributed:
-            model = DDP(model, device_ids=[rank])
-        
-        # Setup optimizer
-        if args.optimizer == "adamw":
-            optimizer = optim.AdamW(model.parameters(), **optimizer_params)
-        elif args.optimizer == "adam":
-            optimizer = optim.Adam(model.parameters(), **optimizer_params)
-        elif args.optimizer == "sgd":
-            optimizer = optim.SGD(model.parameters(), lr=args.learning_rate)
-        elif args.optimizer == "adafactor":
-            optimizer = optim.Adafactor(model.parameters(), **optimizer_params)
-        
-        # Learning rate scheduler with warmup
-        if args.lr_scheduler == "linear":
-            def lr_lambda(current_step):
-                if current_step < warmup_steps:
-                    return float(current_step) / float(max(1, warmup_steps))
-                return max(
-                    0.0, float(total_steps - current_step) / float(max(1, total_steps - warmup_steps))
-                )
-            scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
-        elif args.lr_scheduler == "cosine":
-            scheduler = CosineAnnealingLR(optimizer, T_max=total_steps, eta_min=args.min_learning_rate)
-        elif args.lr_scheduler == "constant":
-            scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lambda step: 1.0)
-        elif args.lr_scheduler == "constant_with_warmup":
-            def lr_lambda(current_step):
-                if current_step < warmup_steps:
-                    return float(current_step) / float(max(1, warmup_steps))
-                return 1.0
-            scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
-    
-    # Resume from checkpoint if specified
-    start_epoch = 0
-    global_step = 0
-    best_val_loss = float('inf')
-    
-    if args.resume_from_checkpoint and os.path.exists(args.resume_from_checkpoint):
-        if should_log:
-            logger.info(f"Loading checkpoint from {args.resume_from_checkpoint}")
-        checkpoint = torch.load(args.resume_from_checkpoint, map_location=f"cuda:{rank}")
-        
-        # Load model weights
-        if isinstance(model, DDP):
-            model.module.load_state_dict(checkpoint["model"])
-        else:
-            model.load_state_dict(checkpoint["model"])
-            
-        # Load optimizer and scheduler states
-        optimizer.load_state_dict(checkpoint["optimizer"])
-        scheduler.load_state_dict(checkpoint["scheduler"])
-        
-        # Resume training state
-        start_epoch = checkpoint["epoch"] + 1
-        global_step = checkpoint["global_step"]
-        best_val_loss = checkpoint.get("best_val_loss", float('inf'))
-        
-        if should_log:
-            logger.info(f"Resuming from epoch {start_epoch} (global step {global_step})")
-    
-    # Training loop
-    if should_log:
-        logger.info("Starting training...")
-    if args.precision in ["fp16", "bf16"] and not args.deepspeed:
-        scaler = torch.amp.GradScaler("cuda", enabled=True)
-    else:
-        scaler = torch.amp.GradScaler("cuda", enabled=False)
-    
-    start_time = time.time()
-    for epoch in range(start_epoch, args.num_epochs):
-        model.train()
-        epoch_loss = 0.0
-        
-        if args.distributed and not args.deepspeed:
-            train_sampler.set_epoch(epoch)
-        
-        progress_bar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{args.num_epochs}")
-        
-        # Zero gradients at the beginning of each epoch (for non-DeepSpeed)
-        if not args.deepspeed:
-            optimizer.zero_grad()
-        
-        for step, batch in enumerate(progress_bar):
-            # Move batch to device (not needed for DeepSpeed)
-            if not args.deepspeed:
-                batch = {k: v.to(device) for k, v in batch.items()}
-            
-            # DeepSpeed handles mixed precision internally
-            if args.deepspeed:
-                # Ensure all tensors are on the correct device
-                cuda_device = torch.device("cuda", rank if torch.cuda.is_available() else "cpu")
-                for k, v in batch.items():
-                    if isinstance(v, torch.Tensor):
-                        batch[k] = v.to(cuda_device)
-                
-                # Forward pass with DeepSpeed
-                outputs = model(**batch)
-                loss = outputs["loss"]
-                
-                # Backward pass with DeepSpeed
-                model.backward(loss)
-                
-                # Update parameters with DeepSpeed
-                if (step + 1) % args.gradient_accumulation_steps == 0 or step == len(train_loader) - 1:
-                    model.step()
-            else:
-                # Standard training path (non-DeepSpeed)
-                # Forward pass with appropriate precision
-                if args.precision in ["fp16", "bf16"]:
-                    with amp.autocast(dtype=torch.bfloat16 if args.precision == "bf16" else torch.float16):
-                        outputs = model(**batch)
-                        # Scale loss by gradient accumulation steps
-                        loss = outputs["loss"] / args.gradient_accumulation_steps
-                else:
-                    outputs = model(**batch)
-                    # Scale loss by gradient accumulation steps
-                    loss = outputs["loss"] / args.gradient_accumulation_steps
-                
-                # Backward pass with mixed precision if enabled
-                if args.precision in ["fp16", "bf16"]:
-                    scaler.scale(loss).backward()
-                else:
-                    loss.backward()
-                
-                # Update parameters every gradient_accumulation_steps
-                if (step + 1) % args.gradient_accumulation_steps == 0 or step == len(train_loader) - 1:
-                    # Gradient clipping
-                    if args.precision in ["fp16", "bf16"]:
-                        scaler.unscale_(optimizer)
-                    
-                    torch.nn.utils.clip_grad_norm_(model.parameters(), args.max_grad_norm)
-                    
-                    # Update parameters with mixed precision if enabled
-                    if args.precision in ["fp16", "bf16"]:
-                        scaler.step(optimizer)
-                        scaler.update()
-                    else:
-                        optimizer.step()
-                    
-                    # Update learning rate
-                    scheduler.step()
-                    
-                    # Zero gradients
-                    optimizer.zero_grad()
-            
-            # Get loss value for logging
-            if args.deepspeed:
-                loss_value = loss.item()
-            else:
-                loss_value = loss.item() * args.gradient_accumulation_steps  # Scale back to get the actual loss
-            
-            # Update progress
-            global_step += 1
-            epoch_loss += loss_value
-            progress_bar.set_postfix({"loss": loss_value, "lr": scheduler.get_last_lr()[0] if not args.deepspeed else model.get_lr()[0]})
-            
-            # Log to wandb
-            if should_log and args.use_wandb and global_step % args.logging_steps == 0:
-                # Get learning rate
-                if args.deepspeed:
-                    current_lr = model.get_lr()[0]
-                else:
-                    current_lr = scheduler.get_last_lr()[0]
-                
-                # Get MoE balance loss if available
-                moe_loss = 0.0
-                if hasattr(model, 'module'):
-                    if hasattr(model.module, 'moe_balance_loss'):
-                        moe_loss = model.module.moe_balance_loss
-                    elif hasattr(model.module, 'layers') and len(model.module.layers) > 0:
-                        # Try to get from the first layer that might have it
-                        for layer in model.module.layers:
-                            if hasattr(layer, 'ffn') and hasattr(layer.ffn, 'sequence_balance_loss'):
-                                moe_loss = layer.ffn.sequence_balance_loss
-                                break
-                
-                # Log detailed metrics
-                metrics = {
-                    "loss": loss_value,  # Use simpler keys for main metrics
-                    "learning_rate": current_lr,
-                    "epoch": epoch + (progress_bar.n / len(progress_bar)),
-                    "global_step": global_step,
-                    "train/samples_per_second": args.batch_size / (time.time() - start_time),
-                    "train/moe_balance_loss": moe_loss
-                }
-                
-                # Add GPU memory usage if available
-                try:
-                    if torch.cuda.is_available():
-                        metrics["system/gpu_memory_allocated"] = torch.cuda.memory_allocated() / (1024 ** 3)  # GB
-                        metrics["system/gpu_memory_reserved"] = torch.cuda.memory_reserved() / (1024 ** 3)  # GB
-                except:
-                    pass
-                
-                # Log metrics to wandb
-                wandb.log(metrics)
-                
-                # Also log to console for visibility
-                if should_log and global_step % (args.logging_steps * 1) == 0:
-                    logger.info(f"Step {global_step}: loss={loss_value:.4f}, lr={current_lr:.6f}, moe_loss={moe_loss:.6f}")
-                
-                # Reset timer for samples per second calculation
-                start_time = time.time()
-            
-            # Save checkpoint
-            if global_step % args.save_steps == 0:
-                if args.deepspeed:
-                    # DeepSpeed handles saving checkpoints
-                    try:
-                        # Only log from rank 0 but all ranks save
-                        checkpoint_path = os.path.join(args.output_dir, f"checkpoint-{global_step}")
-                        if should_log:
-                            logger.info(f"Saving DeepSpeed checkpoint to {checkpoint_path}")
-                        
-                        # Use simpler checkpoint saving to avoid NCCL issues
-                        client_state = {"checkpoint_step": global_step, "epoch": epoch}
-                        success = model.save_checkpoint(args.output_dir, f"checkpoint-{global_step}", client_state=client_state)
-                        
-                        # Only log from rank 0
-                        if should_log:
-                            if success:
-                                logger.info(f"Successfully saved checkpoint at step {global_step}")
-                            else:
-                                logger.warning(f"Failed to save checkpoint at step {global_step}")
-                    except Exception as e:
-                        if should_log:
-                            logger.warning(f"Error saving DeepSpeed checkpoint: {e}")
-                            logger.info("Continuing training despite checkpoint error")
-                else:
-                    if should_log:
-                        save_checkpoint(model, optimizer, scheduler, epoch, global_step, args)
-        
-        # Calculate average epoch loss
-        epoch_loss /= len(train_loader)
-        if should_log:
-            logger.info(f"Epoch {epoch+1}/{args.num_epochs} - Average Loss: {epoch_loss:.4f}")
-        
-        # Validation
-        if val_dataset is not None:
-            val_loss = evaluate(model, val_loader, device, is_deepspeed=args.deepspeed)
-            if should_log:
-                logger.info(f"Epoch {epoch+1}/{args.num_epochs} - Validation Loss: {val_loss:.4f}")
-        
-            # Log validation metrics
-            if should_log and args.use_wandb:
-                wandb.log({
-                    "validation/loss": val_loss,
-                    "validation/epoch": epoch + 1,
-                    "validation/global_step": global_step
-                })
-        
-            # Save best model
-            if should_log and val_loss < best_val_loss:
-                best_val_loss = val_loss
-                save_checkpoint(
-                    model, optimizer, scheduler, epoch, global_step, args,
-                    filename=f"best_model.pt"
-                )
-    
-    # Save final model
-    if should_log:
-        save_checkpoint(
-            model, optimizer, scheduler, args.num_epochs-1, global_step, args,
-            filename=f"final_model.pt"
-        )
-    
-    # Clean up
-    if args.distributed:
-        cleanup_distributed()
-
-def evaluate(model, dataloader, device, is_deepspeed=False):
-    """Evaluate the model on the validation set."""
-    model.eval()
-    total_loss = 0.0
-    
-    with torch.no_grad():
-        for batch in dataloader:
-            # Move batch to device (not needed for DeepSpeed)
-            if not is_deepspeed:
-                batch = {k: v.to(device) for k, v in batch.items()}
-            else:
-                # Ensure all tensors are on the correct device for DeepSpeed
-                for k, v in batch.items():
-                    if isinstance(v, torch.Tensor):
-                        batch[k] = v.to(device)
-            
-            # Forward pass with proper dtype handling
-            try:
-                with torch.cuda.amp.autocast(enabled=True, dtype=torch.bfloat16):
-                    outputs = model(**batch)
-                    loss = outputs["loss"]
-            except RuntimeError as e:
-                # If we encounter a dtype error, try again with explicit casting
-                if "expected scalar type" in str(e):
-                    logger.warning("Dtype mismatch during evaluation, retrying with explicit casting")
-                    # Convert all inputs to the model's dtype
-                    model_dtype = next(model.parameters()).dtype
-                    batch = {k: v.to(dtype=model_dtype) if isinstance(v, torch.Tensor) else v 
-                            for k, v in batch.items()}
-                    outputs = model(**batch)
-                    loss = outputs["loss"]
-                else:
-                    # Re-raise if it's not a dtype error
-                    raise
-            
-            total_loss += loss.item()
-    
-    # Calculate average loss
-    avg_loss = total_loss / len(dataloader)
-    return avg_loss
-
-def save_checkpoint(model, optimizer, scheduler, epoch, global_step, args, filename=None):
-    """Save model checkpoint."""
-    if filename is None:
-        filename = f"checkpoint-{global_step}.pt"
-    
-    checkpoint_path = os.path.join(args.output_dir, filename)
-    os.makedirs(args.output_dir, exist_ok=True)
-    
-    # Get model state dict (handle DDP case)
-    if isinstance(model, DDP):
-        model_state = model.module.state_dict()
-    else:
-        model_state = model.state_dict()
-    
-    # Save checkpoint
-    checkpoint = {
-        "model": model_state,
-        "optimizer": optimizer.state_dict(),
-        "scheduler": scheduler.state_dict(),
-        "epoch": epoch,
-        "global_step": global_step,
-        "args": args,
-        "best_val_loss": args.best_val_loss if hasattr(args, 'best_val_loss') else best_val_loss
-    }
-    
-    torch.save(checkpoint, checkpoint_path)
-    logger.info(f"Saved checkpoint to {checkpoint_path}")
-
-def main():
-    parser = argparse.ArgumentParser(description="Pretrain Quasar model on C4 dataset")
-    
-    # Add local_rank argument for distributed training
-    parser.add_argument("--local_rank", type=int, default=-1, help="Local rank for distributed training")
-    
-    # Data arguments
-    parser.add_argument("--tokenizer_path", type=str, default="./tokenizer.json", help="Path to tokenizer.json file")
-    parser.add_argument("--max_seq_length", type=int, default=8129, help="Maximum sequence length")
-    parser.add_argument("--cache_dir", type=str, default=None, help="Directory to cache datasets")
-    
-    # Training arguments
-    parser.add_argument("--batch_size", type=int, default=8, help="Batch size per GPU")
-    parser.add_argument("--num_epochs", type=int, default=1, help="Number of training epochs")
-    parser.add_argument("--learning_rate", type=float, default=4e-4, help="Peak learning rate")
-    parser.add_argument("--min_learning_rate", type=float, default=4e-5, help="Minimum learning rate for cosine schedule")
-    parser.add_argument("--weight_decay", type=float, default=0.01, help="Weight decay")
-    parser.add_argument("--warmup_ratio", type=float, default=0.01, help="Warmup ratio")
-    parser.add_argument("--adam_beta1", type=float, default=0.9, help="Adam beta1")
-    parser.add_argument("--adam_beta2", type=float, default=0.999, help="Adam beta2")
-    parser.add_argument("--adam_epsilon", type=float, default=1e-8, help="Adam epsilon")
-    parser.add_argument("--max_grad_norm", type=float, default=1.0, help="Max gradient norm")
-    
-    # Optimizer and scheduler arguments
-    parser.add_argument("--optimizer", type=str, default="adamw", choices=["adamw", "adam", "sgd", "adafactor"],
-                        help="Optimizer to use for training")
-    parser.add_argument("--warmup_steps", type=int, default=200, help="Number of steps for linear warmup")
-    parser.add_argument("--lr_scheduler", type=str, default="cosine", 
-                        choices=["linear", "cosine", "constant", "constant_with_warmup"],
-                        help="Learning rate scheduler type")
-    
-    # Logging and saving arguments
-    parser.add_argument("--output_dir", type=str, default="./checkpoints", help="Output directory")
-    parser.add_argument("--logging_steps", type=int, default=5, help="Logging steps")
-    parser.add_argument("--save_steps", type=int, default=1000, help="Save steps")
-    parser.add_argument("--eval_steps", type=int, default=5000, help="Run evaluation every X updates steps")
-    parser.add_argument("--run_name", type=str, default="quasar-pretrain", help="Run name for wandb")
-    parser.add_argument("--use_wandb", action="store_true", help="Whether to use wandb")
-    
-    # Distributed training arguments
-    parser.add_argument("--distributed", action="store_true", help="Whether to use distributed training")
-    parser.add_argument("--world_size", type=int, default=torch.cuda.device_count(), help="Number of GPUs")
-    parser.add_argument("--num_workers", type=int, default=4, help="Number of dataloader workers")
-    parser.add_argument("--seed", type=int, default=42, help="Random seed")
-    
-    # Model arguments
-    parser.add_argument("--use_nsa", action="store_true", help="Whether to use Native Sparse Attention")
-    parser.add_argument("--gradient_checkpointing", action="store_true", help="Enable gradient checkpointing to save memory")
-    parser.add_argument("--gradient_accumulation_steps", type=int, default=1, help="Number of steps to accumulate gradients")
-    parser.add_argument("--precision", type=str, default="bf16", choices=["fp32", "fp16", "bf16", "fp8"], help="Precision for training")
-    parser.add_argument("--deepspeed", action="store_true", help="Enable DeepSpeed for data parallel training")
-    parser.add_argument("--deepspeed_config", type=str, default="deepspeed_config.json", help="DeepSpeed configuration file")
-    parser.add_argument("--resume_from_checkpoint", type=str, default=None, help="Resume training from checkpoint")
-    
-    args = parser.parse_args()
-    
-    # Create output directory
-    os.makedirs(args.output_dir, exist_ok=True)
-    
-    # Set a smaller number of workers if using DeepSpeed to avoid CUDA issues
-    if args.deepspeed and args.num_workers > 0:
-        args.num_workers = min(2, args.num_workers)
-        logger.info(f"Using {args.num_workers} dataloader workers with DeepSpeed")
-    
-    # Launch training
-    if args.deepspeed and DEEPSPEED_AVAILABLE:
-        # DeepSpeed handles distributed training internally
-        # Set environment variables for DeepSpeed
-        if "MASTER_ADDR" not in os.environ:
-            os.environ["MASTER_ADDR"] = "localhost"
-        if "MASTER_PORT" not in os.environ:
-            os.environ["MASTER_PORT"] = "12355"
-            
-        # Get local rank from environment or args
-        local_rank = int(os.environ.get("LOCAL_RANK", args.local_rank))
-        if local_rank == -1:
-            local_rank = 0
-            
-        # Set required environment variables for distributed training if not already set
-        if "RANK" not in os.environ:
-            os.environ["RANK"] = str(local_rank)
-        if "WORLD_SIZE" not in os.environ:
-            os.environ["WORLD_SIZE"] = str(args.world_size)
-            
-        # Log DeepSpeed configuration
-        logger.info(f"Using DeepSpeed for data parallel training across {args.world_size} GPUs")
-        logger.info(f"Local rank: {local_rank}, World size: {args.world_size}")
-        logger.info(f"Environment variables: RANK={os.environ.get('RANK')}, WORLD_SIZE={os.environ.get('WORLD_SIZE')}, MASTER_ADDR={os.environ.get('MASTER_ADDR')}, MASTER_PORT={os.environ.get('MASTER_PORT')}")
-        
-        # Initialize distributed environment if not already done
-        if not torch.distributed.is_initialized():
-            try:
-                torch.distributed.init_process_group(backend="nccl")
-                logger.info("Successfully initialized process group with NCCL backend")
-            except Exception as e:
-                logger.warning(f"Failed to initialize with NCCL, trying Gloo backend: {e}")
-                try:
-                    # Fall back to Gloo backend which has better compatibility
-                    torch.distributed.init_process_group(backend="gloo")
-                    logger.info("Successfully initialized process group with Gloo backend")
-                except Exception as e:
-                    logger.error(f"Failed to initialize distributed environment: {e}")
-                    logger.info("Falling back to non-distributed training")
-                    train(args, 0, 1)
-                    return
-            
-        # Train with DeepSpeed
-        train(args, local_rank, args.world_size)
-    elif args.distributed:
-        logger.info(f"Using distributed training with {args.world_size} GPUs")
-        mp.spawn(train, args=(args, args.world_size), nprocs=args.world_size, join=True)
-    else:
-        train(args, 0, 1)
-
-if __name__ == "__main__":
-    main()
+    return model
