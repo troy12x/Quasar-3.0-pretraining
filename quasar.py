@@ -17,6 +17,7 @@ if TRY_FLASH_ATTENTION:
     except ImportError:
         print("Flash Attention not available, falling back to standard attention")
 
+
 class RMSNorm(nn.Module):
     def __init__(self, dim: int, eps: float = 1e-6):
         super().__init__()
@@ -727,10 +728,10 @@ class QuasarConfig:
         self,
         vocab_size=102400,  # DeepSeek
         hidden_size=2048,   # DeepSeek (dim)
-        num_hidden_layers=27,  # DeepSeek (n_layers)
-        num_attention_heads=16,  # DeepSeek (n_heads)
-        head_dim=16,  # Keep as is unless you want v_head_dim=128
-        intermediate_size=1532,  # DeepSeek (inter_dim)
+        num_hidden_layers=20,  # DeepSeek (n_layers)
+        num_attention_heads=128,  # DeepSeek (n_heads)
+        head_dim=128,  # Keep as is unless you want v_head_dim=128
+        intermediate_size=4096,  # DeepSeek (inter_dim)
         kv_compressed_dim=256,
         query_compressed_dim=512,
         rope_dim_per_head=32,
@@ -745,12 +746,12 @@ class QuasarConfig:
         eos_token_id=2,
         tie_word_embeddings=True,
         use_moe=True,
-        num_experts=66,  # 2 shared + 64 routed
-        num_experts_per_token=4,  # Keep as is
+        num_experts=11,  # 2 shared + 64 routed
+        num_experts_per_token=2,  # Keep as is
         moe_balance_loss_weight=0.01,
         first_layer_no_moe=True,
-        num_shared_experts=2,  # DeepSeek
-        num_routed_experts=64,  # DeepSeek
+        num_shared_experts=1,  # DeepSeek
+        num_routed_experts=10,  # DeepSeek
         top_k=6,  # Reduced from 6 to prevent CUDA indexing errors
         load_balancing_alpha=0.01,
         load_balancing_gamma=0.01,

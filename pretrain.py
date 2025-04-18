@@ -54,7 +54,7 @@ class MultiDataset(Dataset):
         
         # 1. Load all subsets from eyad-silx/wiki-pretrain
         logger.info(f"Loading wiki-pretrain datasets ({split} split)...")
-        wiki_subsets = ["ar", "en"]
+        wiki_subsets = ["ab"]
         for subset in wiki_subsets:
             try:
                 dataset = load_dataset("eyad-silx/wiki-pretrain", subset, split=split, cache_dir=cache_dir)
@@ -68,7 +68,7 @@ class MultiDataset(Dataset):
         # 2. Load code pretraining data
         logger.info(f"Loading code pretraining data ({split} split)...")
         try:
-            code_dataset = load_dataset("ZhentingNLP/code_pretraining_data", split=split, cache_dir=cache_dir)
+            code_dataset = load_dataset("Ashmal/Arabic_Pretraining_10K", split=split, cache_dir=cache_dir)
             self.datasets.append(code_dataset)
             self.dataset_sizes.append(len(code_dataset))
             self.total_size += len(code_dataset)
