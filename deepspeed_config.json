@@ -1,7 +1,7 @@
 {
-    "train_batch_size": 256,
+    "train_batch_size": 64,
     "train_micro_batch_size_per_gpu": 4,
-    "gradient_accumulation_steps": 8,
+    "gradient_accumulation_steps": 2,
     "steps_per_print": 100,
     "zero_optimization": {
         "stage": 3,
@@ -13,14 +13,16 @@
             "device": "cpu",
             "pin_memory": true
         },
-        "stage3_max_live_parameters": 1e8,
-        "stage3_max_reuse_distance": 1e8,
-        "stage3_prefetch_bucket_size": 5e7,
-        "memory_efficient_linear": true,
         "overlap_comm": true,
         "contiguous_gradients": true,
-        "reduce_bucket_size": 5e7,
-        "sub_group_size": 1e7,
+        "reduce_scatter": true,
+        "reduce_bucket_size": 2e7,
+        "allgather_bucket_size": 5e7,
+        "stage3_max_live_parameters": 1e9,
+        "stage3_max_reuse_distance": 1e9,
+        "stage3_prefetch_bucket_size": 2e7,
+        "memory_efficient_linear": true,
+        "sub_group_size": 5e6,
         "stage3_param_persistence_threshold": 1e5,
         "stage3_gather_16bit_weights_on_model_save": true
     },
@@ -67,11 +69,11 @@
     },
     "moe": {
         "enabled": true,
-        "min_capacity": 16,
-        "capacity_factor": 4.0,
+        "min_capacity": 4,
+        "capacity_factor": 1.0,
         "noisy_gate_policy": "None",
-        "drop_tokens": false,
-        "use_rts": false,
+        "drop_tokens": true,
+        "use_rts": true,
         "ep_world_size": 8,
         "ep_mp_size": 1,
         "use_residual": true

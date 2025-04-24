@@ -24,7 +24,7 @@ fi
 
 # Training parameters
 MICRO_BATCH_SIZE=4
-GRADIENT_ACCUMULATION_STEPS=8
+GRADIENT_ACCUMULATION_STEPS=2
 PRECISION="bf16"
 OUTPUT_DIR="./checkpoints"
 SAVE_STEPS=2000
@@ -50,6 +50,12 @@ echo "- Run name: $RUN_NAME"
 # Use existing DeepSpeed config file
 DEEPSPEED_CONFIG="deepspeed_config.json"
 echo "Using existing DeepSpeed config: $DEEPSPEED_CONFIG"
+
+# Performance optimization environment variables
+export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+export TOKENIZERS_PARALLELISM=true
+export OMP_NUM_THREADS=8
+export CUDA_DEVICE_MAX_CONNECTIONS=1
 
 echo "Starting training..."
 echo "========================================================="

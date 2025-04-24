@@ -5,12 +5,81 @@ import torch.nn as nn
 import torch.optim as optim
 import torch.distributed as dist
 import torch.multiprocessing as mp
+import bisect
+import warnings
+import numpy as np
+
+# Simply filter the warnings - this is the most reliable approach
+warnings.filterwarnings("ignore", message=".*The input object of type 'Tensor'.*")
+
+# Define a robust data collator at module level for pickling compatibility
+class RobustDataCollator:
+    def __init__(self, tokenizer):
+        self.tokenizer = tokenizer
+        self.pad_token_id = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else tokenizer.eos_token_id
+        
+    def __call__(self, examples):
+        # Ensure all examples have the required keys
+        required_keys = ["input_ids", "attention_mask", "labels"]
+        for key in required_keys:
+            if not all(key in example for example in examples):
+                raise ValueError(f"All examples must have the '{key}' key")
+        
+        # Extract all tensors
+        input_ids_list = []
+        attention_mask_list = []
+        labels_list = []
+        
+        for example in examples:
+            # Convert to lists if they're tensors
+            if isinstance(example["input_ids"], torch.Tensor):
+                input_ids = example["input_ids"].tolist()
+                attention_mask = example["attention_mask"].tolist()
+                labels = example["labels"].tolist()
+            else:
+                input_ids = example["input_ids"]
+                attention_mask = example["attention_mask"]
+                labels = example["labels"]
+            
+            # Ensure all have the same length within each example
+            min_len = min(len(input_ids), len(attention_mask), len(labels))
+            input_ids = input_ids[:min_len]
+            attention_mask = attention_mask[:min_len]
+            labels = labels[:min_len]
+            
+            input_ids_list.append(input_ids)
+            attention_mask_list.append(attention_mask)
+            labels_list.append(labels)
+        
+        # Find max length in this batch
+        max_length = max(len(ids) for ids in input_ids_list)
+        # Make max_length a multiple of 8 for tensor core efficiency
+        if max_length % 8 != 0:
+            max_length = ((max_length // 8) + 1) * 8
+        
+        # Pad all sequences to max_length
+        for i in range(len(input_ids_list)):
+            padding_length = max_length - len(input_ids_list[i])
+            if padding_length > 0:
+                input_ids_list[i] = input_ids_list[i] + [self.pad_token_id] * padding_length
+                attention_mask_list[i] = attention_mask_list[i] + [0] * padding_length
+                labels_list[i] = labels_list[i] + [-100] * padding_length
+        
+        # Convert to tensors
+        batch = {
+            "input_ids": torch.tensor(input_ids_list, dtype=torch.long),
+            "attention_mask": torch.tensor(attention_mask_list, dtype=torch.long),
+            "labels": torch.tensor(labels_list, dtype=torch.long)
+        }
+        
+        return batch
+
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader, Dataset
 from torch.utils.data.distributed import DistributedSampler
 from torch.optim.lr_scheduler import CosineAnnealingLR
 from datasets import load_dataset
-from transformers import PreTrainedTokenizerFast
+from transformers import PreTrainedTokenizerFast, DataCollatorForLanguageModeling
 from tqdm import tqdm
 import logging
 import argparse
@@ -45,25 +114,45 @@ def is_main_process(local_rank):
     return local_rank in [-1, 0]
 
 class MultiDataset(Dataset):
-    def __init__(self, tokenizer, split="train", max_length=8129, cache_dir=None):
+    def __init__(self, tokenizer, split="train", max_length=1024, cache_dir=None):
         self.tokenizer = tokenizer
         self.max_length = max_length
         self.datasets = []
         self.dataset_sizes = []
         self.total_size = 0
+        self.tokenized_datasets = []
+        self.cumulative_sizes = [0]  # For faster binary search
         
         # 1. Load all subsets from eyad-silx/wiki-pretrain
         logger.info(f"Loading wiki-pretrain datasets ({split} split)...")
-        wiki_subsets = ["CC-MAIN-2024-10"]
+        wiki_subsets = ["en"]
+
+        # Only have rank 0 download the dataset to avoid rate limiting
+        is_main_process = torch.distributed.get_rank() == 0 if torch.distributed.is_initialized() else True
+        
+        if is_main_process:
+            logger.info("Main process downloading datasets...")
+            for subset in wiki_subsets:
+                try:
+                    dataset = load_dataset("eyad-silx/wiki-pretrain", subset, split=split, cache_dir=cache_dir)
+                    logger.info(f"Main process downloaded wiki-pretrain/{subset} with {len(dataset)} examples")
+                except Exception as e:
+                    logger.warning(f"Main process failed to download wiki-pretrain/{subset}: {e}")
+        
+        # Wait for main process to finish downloading
+        if torch.distributed.is_initialized():
+            torch.distributed.barrier()
+        
+        # Now all processes can load from cache
         for subset in wiki_subsets:
             try:
-                dataset = load_dataset("HuggingFaceFW/fineweb", subset, split=split, cache_dir=cache_dir)
+                dataset = load_dataset("eyad-silx/wiki-pretrain", subset, split=split, cache_dir=cache_dir)
                 self.datasets.append(dataset)
                 self.dataset_sizes.append(len(dataset))
                 self.total_size += len(dataset)
-                logger.info(f"Loaded wiki-pretrain/{subset} with {len(dataset)} examples")
+                logger.info(f"Rank {torch.distributed.get_rank() if torch.distributed.is_initialized() else 0} loaded wiki-pretrain/{subset} with {len(dataset)} examples")
             except Exception as e:
-                logger.warning(f"Failed to load wiki-pretrain/{subset}: {e}")
+                logger.warning(f"Failed to load wiki-pretrain/{subset} from cache: {e}")
 
         
         # Check if we have any datasets loaded
@@ -71,57 +160,139 @@ class MultiDataset(Dataset):
             logger.error("Failed to load any datasets! Training will not work.")
         else:
             logger.info(f"Successfully loaded {len(self.datasets)} datasets with a total of {self.total_size} examples")
+            
+            # Pre-tokenize datasets for faster training
+            logger.info("Pre-tokenizing datasets...")
+            for i, dataset in enumerate(self.datasets):
+                # Calculate cumulative sizes for binary search
+                if i > 0:
+                    self.cumulative_sizes.append(self.cumulative_sizes[-1] + self.dataset_sizes[i-1])
+                
+                # Define tokenization function
+                def tokenize_function(examples):
+                    # Handle different dataset formats
+                    # For batched processing, examples will be a dict with keys as column names
+                    # and values as lists
+                    
+                    # Try to find the text column
+                    text_column = None
+                    for column in dataset.column_names:
+                        if column in ["text", "page", "content"]:
+                            text_column = column
+                            break
+                    
+                    if text_column is None:
+                        # If no standard text column, use the first string column
+                        for column in dataset.column_names:
+                            if isinstance(examples[column][0], str):
+                                text_column = column
+                                break
+                    
+                    if text_column is None:
+                        # Fallback to a dummy text
+                        return self.tokenizer(
+                            ["Fallback text"] * len(examples[dataset.column_names[0]]),
+                            truncation=True,
+                            max_length=self.max_length,
+                            return_attention_mask=True
+                        )
+                    
+                    return self.tokenizer(
+                        examples[text_column],
+                        truncation=True,
+                        max_length=self.max_length,
+                        return_attention_mask=True
+                    )
+                
+                # Tokenize the dataset
+                try:
+                    # Use batched processing for speed
+                    tokenized_dataset = dataset.map(
+                        tokenize_function,
+                        batched=True,
+                        batch_size=10000,
+                        num_proc=min(os.cpu_count() // 2, 40),  # Limit to avoid excessive processes
+                        remove_columns=dataset.column_names
+                    )
+                    self.tokenized_datasets.append(tokenized_dataset)
+                    logger.info(f"Pre-tokenized dataset {i+1}/{len(self.datasets)}")
+                except Exception as e:
+                    logger.warning(f"Failed to pre-tokenize dataset {i+1}: {e}")
+                    # Fall back to on-the-fly tokenization for this dataset
+                    self.tokenized_datasets.append(None)
     
     def __len__(self):
         return self.total_size
     
     def __getitem__(self, idx):
-        # Find which dataset this index belongs to
-        dataset_idx = 0
-        local_idx = idx
-        
-        while dataset_idx < len(self.dataset_sizes) and local_idx >= self.dataset_sizes[dataset_idx]:
-            local_idx -= self.dataset_sizes[dataset_idx]
-            dataset_idx += 1
+        # Binary search to find dataset (much faster than linear search)
+        dataset_idx = bisect.bisect_right(self.cumulative_sizes, idx) - 1
+        local_idx = idx - self.cumulative_sizes[dataset_idx]
         
         if dataset_idx >= len(self.datasets):
             raise IndexError(f"Index {idx} out of range for combined dataset of size {self.total_size}")
         
-        # Get the item from the appropriate dataset
-        item = self.datasets[dataset_idx][local_idx]
-        
-        # Extract text based on dataset format
-        if "text" in item:
-            text = item["text"]
-        elif "page" in item:
-            text = item["page"]
-        elif "content" in item:  # For code dataset
-            text = item["content"]
-        else:
-            # Get the first field that contains text
-            for key, value in item.items():
-                if isinstance(value, str) and len(value) > 0:
-                    text = value
-                    break
+        # Check if we have pre-tokenized data
+        if self.tokenized_datasets[dataset_idx] is not None:
+            # Get pre-tokenized data
+            tokenized_item = self.tokenized_datasets[dataset_idx][local_idx]
+            
+            # Convert to tensors if needed (handle both list and tensor inputs)
+            if isinstance(tokenized_item["input_ids"], torch.Tensor):
+                input_ids = tokenized_item["input_ids"]
+                attention_mask = tokenized_item["attention_mask"]
             else:
-                text = "This is a fallback text for empty examples."
-        
-        # Tokenize text
-        encodings = self.tokenizer(
-            text,
-            max_length=self.max_length,
-            truncation=True,
-            padding="max_length",
-            return_tensors="pt"
-        )
-        
-        input_ids = encodings["input_ids"].squeeze()
-        attention_mask = encodings["attention_mask"].squeeze()
-        
-        # Create labels (shifted input_ids for causal language modeling)
-        labels = input_ids.clone()
-        # Mask out padding tokens in labels
-        labels[labels == self.tokenizer.pad_token_id] = -100
+                input_ids = torch.tensor(tokenized_item["input_ids"], dtype=torch.long)
+                attention_mask = torch.tensor(tokenized_item["attention_mask"], dtype=torch.long)
+            
+            # Create labels (shifted input_ids for causal language modeling)
+            labels = input_ids.clone()
+            # Mask out padding tokens in labels
+            labels[labels == self.tokenizer.pad_token_id] = -100
+            
+            # Ensure all tensors have the same length
+            if len(input_ids) != len(labels) or len(input_ids) != len(attention_mask):
+                # Truncate to the shortest length
+                min_length = min(len(input_ids), len(labels), len(attention_mask))
+                input_ids = input_ids[:min_length]
+                attention_mask = attention_mask[:min_length]
+                labels = labels[:min_length]
+        else:
+            # Fallback to on-the-fly tokenization
+            item = self.datasets[dataset_idx][local_idx]
+            
+            # Extract text based on dataset format
+            if "text" in item:
+                text = item["text"]
+            elif "page" in item:
+                text = item["page"]
+            elif "content" in item:  # For code dataset
+                text = item["content"]
+            else:
+                # Get the first field that contains text
+                for key, value in item.items():
+                    if isinstance(value, str) and len(value) > 0:
+                        text = value
+                        break
+                else:
+                    text = "This is a fallback text for empty examples."
+            
+            # Tokenize text with explicit padding to max_length
+            encodings = self.tokenizer(
+                text,
+                max_length=self.max_length,
+                truncation=True,
+                padding="max_length",  # Use explicit padding to max_length
+                return_tensors="pt"
+            )
+            
+            input_ids = encodings["input_ids"].squeeze()
+            attention_mask = encodings["attention_mask"].squeeze()
+            
+            # Create labels (shifted input_ids for causal language modeling)
+            labels = input_ids.clone()
+            # Mask out padding tokens in labels
+            labels[labels == self.tokenizer.pad_token_id] = -100
         
         return {
             "input_ids": input_ids,
@@ -199,17 +370,65 @@ def train(args, rank, world_size):
             logger.info("Loading specific validation dataset: Jackmin108/c4-en-validation-mini")
         # Create a simple validation dataset class that only loads the validation data
         class ValidationDataset(Dataset):
-            def __init__(self, tokenizer, max_length=8129, cache_dir=None):
+            def __init__(self, tokenizer, max_length=1024, cache_dir=None):
                 self.tokenizer = tokenizer
+                self.tokenizer.padding_side = "right"  # Ensure right padding for causal LM
                 self.max_length = max_length
                 # Load the specific validation dataset
                 self.dataset = load_dataset("Jackmin108/c4-en-validation-mini", split="validation", cache_dir=cache_dir)
                 logger.info(f"Loaded validation dataset with {len(self.dataset)} examples")
                 
+                # Pre-tokenize validation dataset for faster evaluation
+                try:
+                    def tokenize_function(examples):
+                        # Handle validation dataset format
+                        text_column = "text" if "text" in examples else next(iter(examples.keys()))
+                        return self.tokenizer(
+                            examples[text_column],
+                            truncation=True,
+                            max_length=self.max_length,
+                            return_attention_mask=True
+                        )
+                        
+                    self.tokenized_dataset = self.dataset.map(
+                        tokenize_function,
+                        batched=True,
+                        batch_size=1000,
+                        num_proc=os.cpu_count() // 6,
+                        remove_columns=self.dataset.column_names
+                    )
+                    logger.info("Pre-tokenized validation dataset")
+                except Exception as e:
+                    logger.warning(f"Failed to pre-tokenize validation dataset: {e}")
+                    self.tokenized_dataset = None
+                
             def __len__(self):
                 return len(self.dataset)
                 
             def __getitem__(self, idx):
+                # Check if we have pre-tokenized data
+                if self.tokenized_dataset is not None:
+                    # Get pre-tokenized data
+                    tokenized_item = self.tokenized_dataset[idx]
+                    
+                    # Convert to tensors if needed (handle both list and tensor inputs)
+                    if isinstance(tokenized_item["input_ids"], torch.Tensor):
+                        input_ids = tokenized_item["input_ids"]
+                        attention_mask = tokenized_item["attention_mask"]
+                    else:
+                        input_ids = torch.tensor(tokenized_item["input_ids"], dtype=torch.long)
+                        attention_mask = torch.tensor(tokenized_item["attention_mask"], dtype=torch.long)
+                    
+                    # Create labels (shifted input_ids for causal language modeling)
+                    labels = input_ids.clone()
+                    # Mask out padding tokens in labels
+                    labels[labels == self.tokenizer.pad_token_id] = -100
+                    
+                    return {
+                        "input_ids": input_ids,
+                        "attention_mask": attention_mask,
+                        "labels": labels
+                    }
                 # Get text from the validation dataset
                 if "text" in self.dataset[idx]:
                     text = self.dataset[idx]["text"]
@@ -222,12 +441,12 @@ def train(args, rank, world_size):
                     else:
                         text = "Validation example."
                 
-                # Tokenize text
+                # Tokenize text with explicit padding to max_length
                 encodings = self.tokenizer(
                     text,
                     max_length=self.max_length,
                     truncation=True,
-                    padding="max_length",
+                    padding="max_length",  # Use explicit padding to max_length
                     return_tensors="pt"
                 )
                 
@@ -267,10 +486,14 @@ def train(args, rank, world_size):
         train_sampler = None
         val_sampler = None
     
+    # Use our robust collator defined at module level
+    data_collator = RobustDataCollator(tokenizer)
+    
     train_loader = DataLoader(
         train_dataset,
         batch_size=args.batch_size,
         sampler=train_sampler,
+        collate_fn=data_collator,  # Use the collator for dynamic padding
         num_workers=args.num_workers,
         pin_memory=True,
         persistent_workers=True if args.num_workers > 0 else False
@@ -283,6 +506,7 @@ def train(args, rank, world_size):
             val_dataset,
             batch_size=args.batch_size,
             sampler=val_sampler,
+            collate_fn=data_collator,  # Use the same collator for validation
             num_workers=args.num_workers,
             pin_memory=True,
             persistent_workers=True if args.num_workers > 0 else False
@@ -829,7 +1053,7 @@ def main():
     
     # Data arguments
     parser.add_argument("--tokenizer_path", type=str, default="./tokenizer.json", help="Path to tokenizer.json file")
-    parser.add_argument("--max_seq_length", type=int, default=8129, help="Maximum sequence length")
+    parser.add_argument("--max_seq_length", type=int, default=1024, help="Maximum sequence length")
     parser.add_argument("--cache_dir", type=str, default=None, help="Directory to cache datasets")
     
     # Training arguments
