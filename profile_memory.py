@@ -4,8 +4,8 @@ import torch
 import argparse
 import json
 import math
-from quasar import QuasarConfig, QuasarTransformerBlock
-from transformers import PreTrainedTokenizerFast
+from quasar import QuasarConfig, Quasar, QuasarTransformerBlock
+from collections import defaultdict
 import gc
 
 class MemoryTracker:
@@ -416,19 +416,29 @@ def profile_deepspeed_config(config_path, model_config, batch_sizes, seq_lengths
     
     return results
 
-def main():
-    parser = argparse.ArgumentParser(description="Profile memory usage of Quasar model")
-    parser.add_argument("--batch_sizes", type=int, nargs="+", default=[4], help="Batch sizes to profile")
-    parser.add_argument("--seq_lengths", type=int, nargs="+", default=[512, 1024, 2048], help="Sequence lengths to profile")
-    parser.add_argument("--dtype", type=str, choices=["fp32", "fp16", "bf16"], default="bf16", help="Data type to use")
-    parser.add_argument("--deepspeed_config", type=str, default="deepspeed_config.json", help="Path to DeepSpeed config")
-    parser.add_argument("--output", type=str, default="memory_profile_results.json", help="Output file for results")
-    args = parser.parse_args()
-    
-    # Create model config
+def profile_moe_memory(batch_size=1, seq_length=1024, memory_efficient=False, memory_threshold=None, dtype_str="bf16"):
+    """Profile memory usage of MoE components in the Quasar model."""
+    # Create config
     config = QuasarConfig()
     
-    print("Quasar Model Configuration:")
+    # Set memory-efficient MoE flag if specified
+    if memory_efficient:
+        config.use_memory_efficient_impl = True
+        print("Using memory-efficient MoE implementation")
+    else:
+        print("Using standard MoE implementation")
+    
+    # Set up device and dtype
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    if dtype_str == "fp32":
+        dtype = torch.float32
+    elif dtype_str == "fp16":
+        dtype = torch.float16
+    else:  # bf16
+        dtype = torch.bfloat16
+    
+    # Print model configuration
+    print(f"\nModel configuration:")
     print(f"  - Hidden size: {config.hidden_size}")
     print(f"  - Number of layers: {config.num_hidden_layers}")
     print(f"  - Number of attention heads: {config.num_attention_heads}")
@@ -437,27 +447,152 @@ def main():
     print(f"  - Number of routed experts: {config.num_routed_experts}")
     print(f"  - Top-k experts: {config.top_k}")
     
-    # Profile with DeepSpeed config
-    results = profile_deepspeed_config(
-        args.deepspeed_config,
-        config,
-        args.batch_sizes,
-        args.seq_lengths,
-        args.dtype
+    # Create model
+    print("\nCreating model...")
+    model = Quasar(config)
+    model.to(device=device, dtype=dtype)
+    
+    # Create dummy inputs
+    print(f"Creating inputs with batch_size={batch_size}, seq_length={seq_length}")
+    input_ids = torch.randint(0, config.vocab_size, (batch_size, seq_length), device=device)
+    attention_mask = torch.ones_like(input_ids)
+    
+    # Track memory for components
+    component_memory = defaultdict(list)
+    
+    # Define components to track
+    components = {
+        'attention': ['QuasarAttention', 'MultiHeadLatentAttention', 'NSAAttention'],
+        'ffn': ['QuasarMLP', 'QuasarMoE'],
+        'moe_routing': ['Router'],
+        'expert_loop': ['QuasarMoE.forward'],
+    }
+    
+    # Profile full model forward pass
+    print("\nProfiling full model forward pass...")
+    with MemoryTracker() as full_tracker:
+        outputs = model(input_ids=input_ids, attention_mask=attention_mask)
+    
+    full_memory_gb = full_tracker.peak_gb
+    print(f"Full model peak memory: {full_memory_gb:.2f} GB")
+    
+    # Profile MoE layers specifically
+    print("\nProfiling MoE components...")
+    
+    # Find MoE modules
+    moe_modules = []
+    for name, module in model.named_modules():
+        if isinstance(module, torch.nn.Module) and 'QuasarMoE' in module.__class__.__name__:
+            moe_modules.append((name, module))
+    
+    # Profile each MoE module
+    for name, module in moe_modules:
+        print(f"\nProfiling {name}...")
+        
+        # Create dummy input for MoE
+        dummy_input = torch.randn(batch_size, seq_length, config.hidden_size, device=device, dtype=dtype)
+        
+        # Profile expert execution loop
+        with MemoryTracker() as expert_tracker:
+            _ = module(dummy_input)
+        
+        expert_memory_gb = expert_tracker.peak_gb
+        component_memory['expert_loop'].append((name, expert_memory_gb))
+        
+        # Check if it exceeds threshold
+        warning = ""
+        if memory_threshold and expert_memory_gb > memory_threshold:
+            warning = f" [EXCEEDS {memory_threshold}GB THRESHOLD!]"
+        
+        print(f"  Expert execution loop: {expert_memory_gb:.2f} GB{warning}")
+    
+    # Print summary
+    print("\n" + "=" * 80)
+    print("MEMORY USAGE SUMMARY")
+    print("=" * 80)
+    
+    print(f"\nFull model forward pass: {full_memory_gb:.2f} GB")
+    if memory_threshold and full_memory_gb > memory_threshold:
+        print(f"WARNING: Total memory exceeds the {memory_threshold}GB threshold!")
+    
+    # Print expert loop memory
+    if component_memory['expert_loop']:
+        total_expert_memory = sum(mem for _, mem in component_memory['expert_loop'])
+        avg_expert_memory = total_expert_memory / len(component_memory['expert_loop'])
+        print(f"\nExpert execution loops:")
+        for name, mem in component_memory['expert_loop']:
+            warning = ""
+            if memory_threshold and mem > memory_threshold:
+                warning = f" [EXCEEDS {memory_threshold}GB THRESHOLD!]"
+            print(f"  {name}: {mem:.2f} GB{warning}")
+        print(f"Average expert loop memory: {avg_expert_memory:.2f} GB")
+    
+    # Print recommendations
+    print("\n" + "=" * 80)
+    print("RECOMMENDATIONS")
+    print("=" * 80)
+    
+    if not memory_efficient and any(mem > (memory_threshold or 16) for _, mem in component_memory['expert_loop']):
+        print("\n1. CRITICAL: Enable memory-efficient MoE implementation with --memory_efficient flag")
+        print("   This implementation only processes tokens assigned to each expert, avoiding full-tensor masking")
+    
+    if full_memory_gb > (memory_threshold or 16):
+        print("\n2. Consider the following additional optimizations:")
+        print("   - Reduce batch size or sequence length")
+        print("   - Reduce number of experts or top-k value")
+        print("   - Enable gradient checkpointing")
+        print("   - Use more aggressive DeepSpeed ZeRO-3 offloading")
+    
+    return full_memory_gb, component_memory
+
+def main():
+    parser = argparse.ArgumentParser(description="Profile memory usage of Quasar model")
+    parser.add_argument("--batch_size", type=int, default=1, help="Batch size for profiling")
+    parser.add_argument("--seq_length", type=int, default=1024, help="Sequence length for profiling")
+    parser.add_argument("--dtype", type=str, choices=["fp32", "fp16", "bf16"], default="bf16", help="Data type to use")
+    parser.add_argument("--memory_threshold", type=float, default=None, 
+                        help="Memory threshold in GB to flag components (e.g., 16 for 16GB GPUs, 80 for 80GB GPUs)")
+    parser.add_argument("--memory_efficient", action="store_true", 
+                        help="Use memory-efficient MoE implementation")
+    parser.add_argument("--deepspeed_config", type=str, default=None, 
+                        help="Path to DeepSpeed config for additional analysis")
+    parser.add_argument("--output", type=str, default="memory_profile_results.json", help="Output file for results")
+    args = parser.parse_args()
+    
+    # Set environment variable for CUDA memory management
+    os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
+    
+    # Run MoE memory profiler
+    full_memory, component_memory = profile_moe_memory(
+        batch_size=args.batch_size,
+        seq_length=args.seq_length,
+        memory_efficient=args.memory_efficient,
+        memory_threshold=args.memory_threshold,
+        dtype_str=args.dtype
     )
     
-    # Save results
-    with open(args.output, 'w') as f:
-        json.dump(results, f, indent=2)
-    
-    print(f"\nResults saved to {args.output}")
-    print("\nRecommendations for reducing memory usage:")
-    print("1. Reduce micro_batch_size and increase gradient_accumulation_steps")
-    print("2. Reduce sequence length if possible")
-    print("3. Reduce number of experts or top-k value")
-    print("4. Enable gradient checkpointing (already enabled in your script)")
-    print("5. Reduce model dimensions (hidden_size, intermediate_size)")
-    print("6. Reduce ZeRO-3 bucket sizes in DeepSpeed config")
+    # Profile with DeepSpeed config if provided
+    if args.deepspeed_config:
+        print("\n\nAnalyzing DeepSpeed configuration...")
+        config = QuasarConfig()
+        
+        # Set memory-efficient MoE flag if specified
+        if args.memory_efficient:
+            config.use_memory_efficient_impl = True
+        
+        results = profile_deepspeed_config(
+            args.deepspeed_config,
+            config,
+            [args.batch_size],
+            [args.seq_length],
+            args.dtype
+        )
+        
+        # Save results
+        with open(args.output, 'w') as f:
+            json.dump(results, f, indent=2)
+        
+        print(f"\nResults saved to {args.output}")
 
 if __name__ == "__main__":
     main()
