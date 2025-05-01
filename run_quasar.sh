@@ -53,16 +53,31 @@ echo "Using existing DeepSpeed config: $DEEPSPEED_CONFIG"
 
 # Performance optimization environment variables
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
-export TOKENIZERS_PARALLELISM=true
+export TOKENIZERS_PARALLELISM=false
 export OMP_NUM_THREADS=8
 export CUDA_DEVICE_MAX_CONNECTIONS=1
+
+# Suppress duplicate logs in multi-GPU setup
+export TORCH_DISTRIBUTED_DEBUG=INFO
+export NCCL_DEBUG=WARN
+export TORCH_SHOW_CPP_STACKTRACES=0
+export CUDA_LAUNCH_BLOCKING=0
+
+# Disable problematic DeepSpeed CUDA extensions
+export DS_BUILD_OPS=0
+export DS_BUILD_AIO=0
+export DS_BUILD_CUFILE=0
+export DISABLE_ADASUM=1
+export DEEPSPEED_AIO=0
 
 echo "Starting training..."
 echo "========================================================="
 
-# Use DeepSpeed for multi-GPU training
-deepspeed \
-    --num_gpus=$NUM_GPUS \
+# Use torchrun instead of deepspeed directly
+torchrun \
+    --nproc_per_node=$NUM_GPUS \
+    --master_addr=127.0.0.1 \
+    --master_port=29500 \
     pretrain.py \
     --deepspeed \
     --deepspeed_config=$DEEPSPEED_CONFIG \
@@ -74,7 +89,8 @@ deepspeed \
     --save_steps=$SAVE_STEPS \
     --gradient_checkpointing \
     --use_wandb \
-    --run_name=$RUN_NAME
+    --run_name=$RUN_NAME \
+    --tokenizer_path=./tokenizer_output
 
 echo "Training complete!"
 echo "Checkpoints saved to: $OUTPUT_DIR"
