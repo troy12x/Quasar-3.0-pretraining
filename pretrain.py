@@ -1,3 +1,24 @@
+# Suppress duplicate logs in multi-GPU setup
+# This must be at the very top of the file, before any other imports
+import os
+import sys
+
+# Check if we're running in a distributed environment
+if "LOCAL_RANK" in os.environ:
+    local_rank = int(os.environ["LOCAL_RANK"])
+    # Only allow rank 0 to output logs
+    if local_rank != 0:
+        # Redirect stdout and stderr to /dev/null
+        sys.stdout = open(os.devnull, 'w')
+        sys.stderr = open(os.devnull, 'w')
+        
+    # Set environment variables to suppress warnings
+    os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
+    os.environ["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
+    os.environ["TORCH_DISTRIBUTED_DEBUG"] = "INFO"
+    os.environ["NCCL_DEBUG"] = "WARN"
+    os.environ["TOKENIZERS_PARALLELISM"] = "false"
+
 import os
 import math
 import torch
@@ -101,6 +122,50 @@ try:
 except ImportError:
     DEEPSPEED_AVAILABLE = False
 
+# Function to suppress output from non-main processes
+def suppress_non_main_process_output():
+    # Only run this once
+    if hasattr(suppress_non_main_process_output, "already_run"):
+        return
+    suppress_non_main_process_output.already_run = True
+    
+    # Import necessary modules
+    import os
+    import sys
+    
+    # Early check for distributed environment
+    if not torch.distributed.is_initialized():
+        try:
+            local_rank = int(os.environ.get("LOCAL_RANK", -1))
+            if local_rank != -1:
+                # Set device before initializing process group
+                torch.cuda.set_device(local_rank)
+                
+                # Only suppress output for non-zero ranks
+                if local_rank != 0:
+                    # Redirect stdout and stderr to /dev/null
+                    sys.stdout = open(os.devnull, 'w')
+                    sys.stderr = open(os.devnull, 'w')
+        except Exception as e:
+            pass
+    elif torch.distributed.get_rank() != 0:
+        # For already initialized distributed environment
+        # Redirect stdout and stderr to /dev/null for non-main processes
+        sys.stdout = open(os.devnull, 'w')
+        sys.stderr = open(os.devnull, 'w')
+    
+    # Set environment variables to suppress CUDA warnings
+    os.environ["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
+    os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
+    os.environ["TORCH_DISTRIBUTED_DEBUG"] = "INFO"
+    os.environ["NCCL_DEBUG"] = "WARN"
+
+# Call the suppression function as early as possible
+if "LOCAL_RANK" in os.environ:
+    local_rank = int(os.environ["LOCAL_RANK"])
+    if local_rank != 0:
+        suppress_non_main_process_output()
+
 # Setup logging
 logging.basicConfig(
     format="%(asctime)s - %(levelname)s - %(name)s - %(message)s",
@@ -108,6 +173,17 @@ logging.basicConfig(
     level=logging.INFO,
 )
 logger = logging.getLogger(__name__)
+
+# Create a custom filter to only log from the main process
+class MainProcessFilter(logging.Filter):
+    def filter(self, record):
+        # Only allow logs from the main process (rank 0)
+        if torch.distributed.is_initialized():
+            return torch.distributed.get_rank() == 0
+        return True
+
+# Apply the filter to the root logger
+logging.getLogger().addFilter(MainProcessFilter())
 
 # Function to check if this is the main process
 def is_main_process(local_rank):
@@ -125,7 +201,7 @@ class MultiDataset(Dataset):
         
         # 1. Load all subsets from eyad-silx/wiki-pretrain
         logger.info(f"Loading wiki-pretrain datasets ({split} split)...")
-        wiki_subsets = ["en"]
+        wiki_subsets = ["ext"]
 
         # Only have rank 0 download the dataset to avoid rate limiting
         is_main_process = torch.distributed.get_rank() == 0 if torch.distributed.is_initialized() else True
@@ -250,13 +326,11 @@ class MultiDataset(Dataset):
             # Mask out padding tokens in labels
             labels[labels == self.tokenizer.pad_token_id] = -100
             
-            # Ensure all tensors have the same length
-            if len(input_ids) != len(labels) or len(input_ids) != len(attention_mask):
-                # Truncate to the shortest length
-                min_length = min(len(input_ids), len(labels), len(attention_mask))
-                input_ids = input_ids[:min_length]
-                attention_mask = attention_mask[:min_length]
-                labels = labels[:min_length]
+            return {
+                "input_ids": input_ids,
+                "attention_mask": attention_mask,
+                "labels": labels
+            }
         else:
             # Fallback to on-the-fly tokenization
             item = self.datasets[dataset_idx][local_idx]
@@ -1151,6 +1225,9 @@ def main():
                     train(args, 0, 1)
                     return
             
+        # Suppress output from non-main processes
+        suppress_non_main_process_output()
+        
         # Train with DeepSpeed
         train(args, local_rank, args.world_size)
     elif args.distributed:

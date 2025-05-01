@@ -77,5 +77,25 @@
         "ep_world_size": 8,
         "ep_mp_size": 1,
         "use_residual": true
+    },
+    "checkpoint": {
+        "tag_validation": "WARN"
+    },
+    "aio": {
+        "block_size": 1048576,
+        "queue_depth": 8,
+        "thread_count": 1,
+        "single_submit": false,
+        "overlap_events": true,
+        "enabled": false
+    },
+    "flops_profiler": {
+        "enabled": false
+    },
+    "sparse_attention": {
+        "enabled": false
+    },
+    "comms_logger": {
+        "enabled": false
     }
 }

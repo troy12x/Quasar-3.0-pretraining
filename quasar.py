@@ -5,6 +5,12 @@ import torch.nn as nn
 import torch.nn.functional as F
 from native_sparse_attention import NativeSparseAttention
 
+# Check if we're the main process for logging
+def is_main_process_for_logging():
+    if torch.distributed.is_initialized():
+        return torch.distributed.get_rank() == 0
+    return True
+
 # Check if Flash Attention is available
 TRY_FLASH_ATTENTION = True
 HAS_FLASH_ATTENTION = False
@@ -13,9 +19,11 @@ if TRY_FLASH_ATTENTION:
         from flash_attn import flash_attn_func, flash_attn_varlen_func
         from flash_attn.bert_padding import index_first_axis, pad_input, unpad_input
         HAS_FLASH_ATTENTION = True
-        print("Flash Attention is available and will be used for faster training")
+        if is_main_process_for_logging():
+            print("Flash Attention is available and will be used for faster training")
     except ImportError:
-        print("Flash Attention not available, falling back to standard attention")
+        if is_main_process_for_logging():
+            print("Flash Attention not available, falling back to standard attention")
 
 class RMSNorm(nn.Module):
     def __init__(self, dim: int, eps: float = 1e-6):
