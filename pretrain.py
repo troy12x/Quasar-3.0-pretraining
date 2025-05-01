@@ -110,8 +110,28 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # Function to check if this is the main process
-def is_main_process(local_rank):
-    return local_rank in [-1, 0]
+def is_main_process(local_rank=None):
+    if torch.distributed.is_initialized():
+        return torch.distributed.get_rank() == 0
+    if local_rank is not None:
+        return local_rank in [-1, 0]
+    return True
+
+# Function to check if distributed is initialized and get rank
+def get_rank():
+    if torch.distributed.is_initialized():
+        return torch.distributed.get_rank()
+    if "LOCAL_RANK" in os.environ:
+        return int(os.environ["LOCAL_RANK"])
+    return 0
+
+# Function to check if distributed is initialized and get world size
+def get_world_size():
+    if torch.distributed.is_initialized():
+        return torch.distributed.get_world_size()
+    if "WORLD_SIZE" in os.environ:
+        return int(os.environ["WORLD_SIZE"])
+    return 1
 
 class MultiDataset(Dataset):
     def __init__(self, tokenizer, split="train", max_length=1024, cache_dir=None):
@@ -686,9 +706,8 @@ def train(args, rank, world_size):
                 }
             }
         
-        # Move model to GPU before DeepSpeed initialization
-        device = torch.device("cuda", rank) if torch.cuda.is_available() else torch.device("cpu")
-        model = model.to(device)
+        # Let DeepSpeed handle model placement - don't move to device first
+        # This prevents OOM errors with large models
         
         # Initialize DeepSpeed
         model, optimizer, _, scheduler = deepspeed.initialize(
@@ -1046,97 +1065,97 @@ def save_checkpoint(model, optimizer, scheduler, epoch, global_step, args, filen
     logger.info(f"Saved checkpoint to {checkpoint_path}")
 
 def main():
-    parser = argparse.ArgumentParser(description="Pretrain Quasar model on C4 dataset")
-    
-    # Add local_rank argument for distributed training
-    parser.add_argument("--local_rank", type=int, default=-1, help="Local rank for distributed training")
-    
+    parser = argparse.ArgumentParser(description="Quasar 3.0 Pretraining")
+
     # Data arguments
-    parser.add_argument("--tokenizer_path", type=str, default="./tokenizer.json", help="Path to tokenizer.json file")
+    parser.add_argument("--tokenizer_path", type=str, default="./tokenizer_output", help="Path to the tokenizer")
+    parser.add_argument("--dataset", type=str, default="wiki-pretrain", help="Dataset to use for training")
+    parser.add_argument("--val_dataset", type=str, default="Jackmin108/c4-en-validation-mini", help="Dataset to use for validation")
     parser.add_argument("--max_seq_length", type=int, default=1024, help="Maximum sequence length")
-    parser.add_argument("--cache_dir", type=str, default=None, help="Directory to cache datasets")
-    
+    parser.add_argument("--cache_dir", type=str, default=None, help="Cache directory for datasets")
+
     # Training arguments
-    parser.add_argument("--batch_size", type=int, default=8, help="Batch size per GPU")
-    parser.add_argument("--num_epochs", type=int, default=1, help="Number of training epochs")
-    parser.add_argument("--learning_rate", type=float, default=4e-4, help="Peak learning rate")
-    parser.add_argument("--min_learning_rate", type=float, default=4e-5, help="Minimum learning rate for cosine schedule")
+    parser.add_argument("--batch_size", type=int, default=4, help="Batch size per GPU")
+    parser.add_argument("--gradient_accumulation_steps", type=int, default=1, help="Number of gradient accumulation steps")
+    parser.add_argument("--learning_rate", type=float, default=3e-4, help="Learning rate")
     parser.add_argument("--weight_decay", type=float, default=0.01, help="Weight decay")
-    parser.add_argument("--warmup_ratio", type=float, default=0.01, help="Warmup ratio")
     parser.add_argument("--adam_beta1", type=float, default=0.9, help="Adam beta1")
     parser.add_argument("--adam_beta2", type=float, default=0.999, help="Adam beta2")
     parser.add_argument("--adam_epsilon", type=float, default=1e-8, help="Adam epsilon")
-    parser.add_argument("--max_grad_norm", type=float, default=1.0, help="Max gradient norm")
-    
-    # Optimizer and scheduler arguments
-    parser.add_argument("--optimizer", type=str, default="adamw", choices=["adamw", "adam", "sgd", "adafactor"],
-                        help="Optimizer to use for training")
-    parser.add_argument("--warmup_steps", type=int, default=200, help="Number of steps for linear warmup")
-    parser.add_argument("--lr_scheduler", type=str, default="cosine", 
-                        choices=["linear", "cosine", "constant", "constant_with_warmup"],
-                        help="Learning rate scheduler type")
-    
-    # Logging and saving arguments
-    parser.add_argument("--output_dir", type=str, default="./checkpoints", help="Output directory")
-    parser.add_argument("--logging_steps", type=int, default=5, help="Logging steps")
-    parser.add_argument("--save_steps", type=int, default=1000, help="Save steps")
-    parser.add_argument("--eval_steps", type=int, default=5000, help="Run evaluation every X updates steps")
-    parser.add_argument("--run_name", type=str, default="quasar-pretrain", help="Run name for wandb")
-    parser.add_argument("--use_wandb", action="store_true", help="Whether to use wandb")
-    
-    # Distributed training arguments
-    parser.add_argument("--distributed", action="store_true", help="Whether to use distributed training")
-    parser.add_argument("--world_size", type=int, default=torch.cuda.device_count(), help="Number of GPUs")
-    parser.add_argument("--num_workers", type=int, default=4, help="Number of dataloader workers")
+    parser.add_argument("--max_grad_norm", type=float, default=1.0, help="Maximum gradient norm")
+    parser.add_argument("--num_train_epochs", type=int, default=1, help="Number of training epochs")
+    parser.add_argument("--max_steps", type=int, default=-1, help="Maximum number of training steps")
+    parser.add_argument("--warmup_steps", type=int, default=1000, help="Number of warmup steps")
+    parser.add_argument("--logging_steps", type=int, default=100, help="Number of steps between logging")
+    parser.add_argument("--save_steps", type=int, default=5000, help="Number of steps between saving checkpoints")
+    parser.add_argument("--eval_steps", type=int, default=5000, help="Number of steps between evaluations")
+    parser.add_argument("--output_dir", type=str, default="./checkpoints", help="Output directory for checkpoints")
     parser.add_argument("--seed", type=int, default=42, help="Random seed")
-    
-    # Model arguments
-    parser.add_argument("--use_nsa", action="store_true", help="Whether to use Native Sparse Attention")
-    parser.add_argument("--gradient_checkpointing", action="store_true", help="Enable gradient checkpointing to save memory")
-    parser.add_argument("--gradient_accumulation_steps", type=int, default=1, help="Number of steps to accumulate gradients")
-    parser.add_argument("--precision", type=str, default="bf16", choices=["fp32", "fp16", "bf16", "fp8"], help="Precision for training")
-    parser.add_argument("--deepspeed", action="store_true", help="Enable DeepSpeed for data parallel training")
+    parser.add_argument("--fp16", action="store_true", help="Use FP16 precision")
+    parser.add_argument("--bf16", action="store_true", help="Use BF16 precision")
+    parser.add_argument("--precision", type=str, default="bf16", choices=["fp32", "fp16", "bf16"], help="Precision to use for training")
+    parser.add_argument("--gradient_checkpointing", action="store_true", help="Use gradient checkpointing")
+    parser.add_argument("--optimizer", type=str, default="adamw", choices=["adamw", "adam", "sgd"], help="Optimizer to use")
+    parser.add_argument("--scheduler", type=str, default="cosine", choices=["cosine", "linear", "constant"], help="Learning rate scheduler")
+
+    # Distributed training arguments
+    parser.add_argument("--local_rank", type=int, default=-1, help="Local rank for distributed training")
+    parser.add_argument("--distributed", action="store_true", help="Use distributed training")
+    parser.add_argument("--world_size", type=int, default=1, help="World size for distributed training")
+
+    # DeepSpeed arguments
+    parser.add_argument("--deepspeed", action="store_true", help="Use DeepSpeed")
     parser.add_argument("--deepspeed_config", type=str, default="deepspeed_config.json", help="DeepSpeed configuration file")
-    parser.add_argument("--resume_from_checkpoint", type=str, default=None, help="Resume training from checkpoint")
-    
+
+    # Logging arguments
+    parser.add_argument("--use_wandb", action="store_true", help="Use Weights & Biases for logging")
+    parser.add_argument("--wandb_project", type=str, default="quasar-pretrain", help="Weights & Biases project name")
+    parser.add_argument("--wandb_entity", type=str, default=None, help="Weights & Biases entity name")
+    parser.add_argument("--run_name", type=str, default=None, help="Run name for logging")
+
+    # Parse arguments
     args = parser.parse_args()
-    
+
+    # Set random seed
+    torch.manual_seed(args.seed)
+    np.random.seed(args.seed)
+    random.seed(args.seed)
+
+    # Set up logging
+    if args.run_name is None:
+        args.run_name = f"quasar3-training-{time.strftime('%Y%m%d-%H%M%S')}"
+
+    # Set up distributed training
+    if args.local_rank != -1 or "LOCAL_RANK" in os.environ:
+        args.distributed = True
+        if args.local_rank == -1:
+            args.local_rank = int(os.environ.get("LOCAL_RANK", 0))
+        args.world_size = int(os.environ.get("WORLD_SIZE", args.world_size))
+
+    # Set precision
+    if args.fp16:
+        args.precision = "fp16"
+    elif args.bf16:
+        args.precision = "bf16"
+
     # Create output directory
-    os.makedirs(args.output_dir, exist_ok=True)
-    
-    # Set a smaller number of workers if using DeepSpeed to avoid CUDA issues
-    if args.deepspeed and args.num_workers > 0:
-        args.num_workers = min(2, args.num_workers)
-        logger.info(f"Using {args.num_workers} dataloader workers with DeepSpeed")
-    
-    # Launch training
-    if args.deepspeed and DEEPSPEED_AVAILABLE:
-        # DeepSpeed handles distributed training internally
-        # Set environment variables for DeepSpeed
-        if "MASTER_ADDR" not in os.environ:
-            os.environ["MASTER_ADDR"] = "localhost"
-        if "MASTER_PORT" not in os.environ:
-            os.environ["MASTER_PORT"] = "12355"
-            
-        # Get local rank from environment or args
-        local_rank = int(os.environ.get("LOCAL_RANK", args.local_rank))
-        if local_rank == -1:
-            local_rank = 0
-            
-        # Set required environment variables for distributed training if not already set
-        if "RANK" not in os.environ:
-            os.environ["RANK"] = str(local_rank)
-        if "WORLD_SIZE" not in os.environ:
-            os.environ["WORLD_SIZE"] = str(args.world_size)
-            
-        # Log DeepSpeed configuration
-        logger.info(f"Using DeepSpeed for data parallel training across {args.world_size} GPUs")
+    if is_main_process(args.local_rank):
+        os.makedirs(args.output_dir, exist_ok=True)
+
+    # Initialize distributed environment
+    local_rank = args.local_rank
+
+    # Check if we're using DeepSpeed or torchrun
+    if args.deepspeed or "RANK" in os.environ:
+        # Log distributed training configuration
+        logger.info(f"Using distributed training across {args.world_size} GPUs")
         logger.info(f"Local rank: {local_rank}, World size: {args.world_size}")
         logger.info(f"Environment variables: RANK={os.environ.get('RANK')}, WORLD_SIZE={os.environ.get('WORLD_SIZE')}, MASTER_ADDR={os.environ.get('MASTER_ADDR')}, MASTER_PORT={os.environ.get('MASTER_PORT')}")
-        
+
         # Initialize distributed environment if not already done
         if not torch.distributed.is_initialized():
             try:
+                # Try to use NCCL backend first (faster for GPU training)
                 torch.distributed.init_process_group(backend="nccl")
                 logger.info("Successfully initialized process group with NCCL backend")
             except Exception as e:
@@ -1150,13 +1169,23 @@ def main():
                     logger.info("Falling back to non-distributed training")
                     train(args, 0, 1)
                     return
-            
-        # Train with DeepSpeed
+
+        # Set device for this process
+        torch.cuda.set_device(local_rank)
+
+        # Update world_size based on initialized process group
+        if torch.distributed.is_initialized():
+            args.world_size = torch.distributed.get_world_size()
+            args.local_rank = torch.distributed.get_rank()
+            local_rank = args.local_rank
+
+        # Train with distributed setup
         train(args, local_rank, args.world_size)
     elif args.distributed:
-        logger.info(f"Using distributed training with {args.world_size} GPUs")
+        logger.info(f"Using distributed training with {args.world_size} GPUs via mp.spawn")
         mp.spawn(train, args=(args, args.world_size), nprocs=args.world_size, join=True)
     else:
+        logger.info("Using single GPU training")
         train(args, 0, 1)
 
 if __name__ == "__main__":

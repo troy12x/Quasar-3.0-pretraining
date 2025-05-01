@@ -1,5 +1,5 @@
 {
-    "train_batch_size": 64,
+    "train_batch_size": 32,
     "train_micro_batch_size_per_gpu": 4,
     "gradient_accumulation_steps": 2,
     "steps_per_print": 100,
@@ -77,25 +77,5 @@
         "ep_world_size": 8,
         "ep_mp_size": 1,
         "use_residual": true
-    },
-    "checkpoint": {
-        "tag_validation": "WARN"
-    },
-    "aio": {
-        "block_size": 1048576,
-        "queue_depth": 8,
-        "thread_count": 1,
-        "single_submit": false,
-        "overlap_events": true,
-        "enabled": false
-    },
-    "flops_profiler": {
-        "enabled": false
-    },
-    "sparse_attention": {
-        "enabled": false
-    },
-    "comms_logger": {
-        "enabled": false
     }
 }
