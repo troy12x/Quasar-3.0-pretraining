@@ -53,43 +53,16 @@ echo "Using existing DeepSpeed config: $DEEPSPEED_CONFIG"
 
 # Performance optimization environment variables
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
-export TOKENIZERS_PARALLELISM=false
+export TOKENIZERS_PARALLELISM=true
 export OMP_NUM_THREADS=8
 export CUDA_DEVICE_MAX_CONNECTIONS=1
-
-# Suppress duplicate logs in multi-GPU setup
-export TORCH_DISTRIBUTED_DEBUG=INFO
-export NCCL_DEBUG=WARN
-export TORCH_SHOW_CPP_STACKTRACES=0
-export CUDA_LAUNCH_BLOCKING=0
-
-# Disable problematic DeepSpeed CUDA extensions
-export DS_BUILD_OPS=0
-export DS_BUILD_AIO=0
-export DS_BUILD_CUFILE=0
-export DISABLE_ADASUM=1
-export DEEPSPEED_AIO=0
-
-### Fix numpy and scikit-learn compatibility issues
-#echo "Fixing numpy and scikit-learn compatibility..."
-# First uninstall all potentially conflicting packages
-#pip uninstall -y numpy scikit-learn scipy transformers
-# Install numpy first with exact version
-#pip install numpy==1.23.4
-# Force reinstall with --no-deps to avoid upgrading numpy
-#pip install --no-deps scikit-learn==1.2.2
-#pip install --no-deps scipy==1.10.1
-# Reinstall transformers with compatible versions
-#pip install transformers==4.30.2
 
 echo "Starting training..."
 echo "========================================================="
 
-# Use torchrun instead of deepspeed directly
-torchrun \
-    --nproc_per_node=$NUM_GPUS \
-    --master_addr=127.0.0.1 \
-    --master_port=29500 \
+# Use DeepSpeed for multi-GPU training
+deepspeed \
+    --num_gpus=$NUM_GPUS \
     pretrain.py \
     --deepspeed \
     --deepspeed_config=$DEEPSPEED_CONFIG \
@@ -102,7 +75,7 @@ torchrun \
     --gradient_checkpointing \
     --use_wandb \
     --run_name=$RUN_NAME \
-    --tokenizer_path=./tokenizer_output
+    --tokenizer_path=./tokenizer_output/tokenizer.json
 
 echo "Training complete!"
 echo "Checkpoints saved to: $OUTPUT_DIR"
