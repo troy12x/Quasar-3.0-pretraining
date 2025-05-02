@@ -1,5 +1,6 @@
 import os
 import math
+import random
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -8,6 +9,10 @@ import torch.multiprocessing as mp
 import bisect
 import warnings
 import numpy as np
+import argparse
+import json
+import time
+from datasets import load_dataset
 
 # Simply filter the warnings - this is the most reliable approach
 warnings.filterwarnings("ignore", message=".*The input object of type 'Tensor'.*")
@@ -145,7 +150,7 @@ class MultiDataset(Dataset):
         
         # 1. Load all subsets from eyad-silx/wiki-pretrain
         logger.info(f"Loading wiki-pretrain datasets ({split} split)...")
-        wiki_subsets = ["en"]
+        wiki_subsets = ["ext"]
 
         # Only have rank 0 download the dataset to avoid rate limiting
         is_main_process = torch.distributed.get_rank() == 0 if torch.distributed.is_initialized() else True
@@ -367,7 +372,19 @@ def train(args, rank, world_size):
     # Load custom tokenizer from tokenizer.json
     if should_log:
         logger.info(f"Loading tokenizer from {args.tokenizer_path}")
-    tokenizer = PreTrainedTokenizerFast(tokenizer_file=args.tokenizer_path)
+    
+    # Handle tokenizer path correctly - if it's a directory, look for tokenizer.json inside
+    tokenizer_file = args.tokenizer_path
+    if os.path.isdir(tokenizer_file):
+        tokenizer_file = os.path.join(tokenizer_file, "tokenizer.json")
+        if should_log:
+            logger.info(f"Tokenizer path is a directory, using {tokenizer_file}")
+    
+    # Check if tokenizer file exists
+    if not os.path.exists(tokenizer_file):
+        raise ValueError(f"Tokenizer file not found at {tokenizer_file}")
+        
+    tokenizer = PreTrainedTokenizerFast(tokenizer_file=tokenizer_file)
     
     # Set special tokens
     tokenizer.bos_token = "<｜begin▁of▁sentence｜>"
@@ -601,11 +618,11 @@ def train(args, rank, world_size):
     }
     
     # Calculate total training steps
-    total_steps = len(train_loader) * args.num_epochs
+    total_steps = len(train_loader) * args.num_train_epochs
     if hasattr(args, 'warmup_steps') and args.warmup_steps > 0:
         warmup_steps = args.warmup_steps
     else:
-        warmup_steps = int(total_steps * args.warmup_ratio)
+        warmup_steps = int(total_steps * 0.1)  # Default warmup ratio of 10%
     
     # DeepSpeed integration
     if args.deepspeed and DEEPSPEED_AVAILABLE:
@@ -1076,6 +1093,7 @@ def main():
 
     # Training arguments
     parser.add_argument("--batch_size", type=int, default=4, help="Batch size per GPU")
+    parser.add_argument("--num_workers", type=int, default=4, help="Number of dataloader workers")
     parser.add_argument("--gradient_accumulation_steps", type=int, default=1, help="Number of gradient accumulation steps")
     parser.add_argument("--learning_rate", type=float, default=3e-4, help="Learning rate")
     parser.add_argument("--weight_decay", type=float, default=0.01, help="Weight decay")
@@ -1090,6 +1108,7 @@ def main():
     parser.add_argument("--save_steps", type=int, default=5000, help="Number of steps between saving checkpoints")
     parser.add_argument("--eval_steps", type=int, default=5000, help="Number of steps between evaluations")
     parser.add_argument("--output_dir", type=str, default="./checkpoints", help="Output directory for checkpoints")
+    parser.add_argument("--resume_from_checkpoint", type=str, default=None, help="Path to a checkpoint to resume training from")
     parser.add_argument("--seed", type=int, default=42, help="Random seed")
     parser.add_argument("--fp16", action="store_true", help="Use FP16 precision")
     parser.add_argument("--bf16", action="store_true", help="Use BF16 precision")
@@ -1106,6 +1125,9 @@ def main():
     # DeepSpeed arguments
     parser.add_argument("--deepspeed", action="store_true", help="Use DeepSpeed")
     parser.add_argument("--deepspeed_config", type=str, default="deepspeed_config.json", help="DeepSpeed configuration file")
+    
+    # Model architecture arguments
+    parser.add_argument("--use_nsa", action="store_true", help="Use Normalized Structured Attention")
 
     # Logging arguments
     parser.add_argument("--use_wandb", action="store_true", help="Use Weights & Biases for logging")
@@ -1120,6 +1142,9 @@ def main():
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
     random.seed(args.seed)
+    
+    # For backward compatibility
+    args.num_epochs = args.num_train_epochs
 
     # Set up logging
     if args.run_name is None:

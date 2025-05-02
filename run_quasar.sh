@@ -70,6 +70,18 @@ export DS_BUILD_CUFILE=0
 export DISABLE_ADASUM=1
 export DEEPSPEED_AIO=0
 
+### Fix numpy and scikit-learn compatibility issues
+#echo "Fixing numpy and scikit-learn compatibility..."
+# First uninstall all potentially conflicting packages
+#pip uninstall -y numpy scikit-learn scipy transformers
+# Install numpy first with exact version
+#pip install numpy==1.23.4
+# Force reinstall with --no-deps to avoid upgrading numpy
+#pip install --no-deps scikit-learn==1.2.2
+#pip install --no-deps scipy==1.10.1
+# Reinstall transformers with compatible versions
+#pip install transformers==4.30.2
+
 echo "Starting training..."
 echo "========================================================="
 
