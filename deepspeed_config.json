@@ -67,6 +67,7 @@
         "synchronize_checkpoint_boundary": false,
         "profile": false
     },
+    "zero_trust_kernel_optimizations": true,
     "moe": {
         "enabled": true,
         "min_capacity": 4,

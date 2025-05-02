@@ -14,7 +14,7 @@ def install_dependencies():
     
     # Core dependencies with specific versions to ensure compatibility
     dependencies = [
-        "numpy==1.23.4",  # Use NumPy 1.23.4 for best compatibility with DeepSpeed and other libraries
+        "numpy==1.23.5",  # Use NumPy 1.23.5 for compatibility with libraries that might use np.int
         "torch>=2.0.0",
         "transformers>=4.30.0",
         "datasets>=2.12.0",
@@ -34,7 +34,6 @@ def install_dependencies():
     subprocess.check_call([sys.executable, "-m", "pip", "install", "-U", "accelerate", "bitsandbytes"])
     
     print("\nEnvironment setup complete!")
-    print("You can now run pretraining with: python run_pretrain.py --batch_size 8 --precision bf16 --gradient_accumulation_steps 4 --deepspeed --gradient_checkpointing")
 
 if __name__ == "__main__":
     install_dependencies()

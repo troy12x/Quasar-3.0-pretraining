@@ -5,12 +5,6 @@ import torch.nn as nn
 import torch.nn.functional as F
 from native_sparse_attention import NativeSparseAttention
 
-# Check if we're the main process for logging
-def is_main_process_for_logging():
-    if torch.distributed.is_initialized():
-        return torch.distributed.get_rank() == 0
-    return True
-
 # Check if Flash Attention is available
 TRY_FLASH_ATTENTION = True
 HAS_FLASH_ATTENTION = False
@@ -19,11 +13,9 @@ if TRY_FLASH_ATTENTION:
         from flash_attn import flash_attn_func, flash_attn_varlen_func
         from flash_attn.bert_padding import index_first_axis, pad_input, unpad_input
         HAS_FLASH_ATTENTION = True
-        if is_main_process_for_logging():
-            print("Flash Attention is available and will be used for faster training")
+        print("Flash Attention is available and will be used for faster training")
     except ImportError:
-        if is_main_process_for_logging():
-            print("Flash Attention not available, falling back to standard attention")
+        print("Flash Attention not available, falling back to standard attention")
 
 class RMSNorm(nn.Module):
     def __init__(self, dim: int, eps: float = 1e-6):
@@ -590,9 +582,6 @@ class QuasarMoE(nn.Module):
         self.alpha = getattr(config, 'load_balancing_alpha', 0.01)  # Alpha for sequence-wise auxiliary loss
         self.gamma = getattr(config, 'load_balancing_gamma', 0.01)  # Gamma for token-wise auxiliary loss
         
-        # Memory-efficient implementation flag
-        self.use_memory_efficient_impl = True
-        
         # Shared experts
         self.shared_experts = nn.ModuleList([
             QuasarExpertFFN(config) for _ in range(self.num_shared_experts)
@@ -632,112 +621,62 @@ class QuasarMoE(nn.Module):
             shared_output += self.shared_experts[i](x)
         shared_output /= self.num_shared_experts
         
-        # Initialize load balancing counters if needed
-        if update_biases and self.training:
-            expert_counts = torch.zeros(self.num_routed_experts, device=x.device, dtype=x.dtype)
-            sequence_counts = torch.zeros(batch_size, self.num_routed_experts, device=x.device, dtype=x.dtype)
+        # Process with routed experts - use a deterministic approach for gradient checkpointing
+        routed_output = torch.zeros_like(x)
         
-        # Use memory-efficient implementation
-        if self.use_memory_efficient_impl:
-            # Reshape for token-based processing
-            x_flat = x.reshape(-1, x.size(-1))  # [batch*seq, hidden]
-            batch_seq_indices = torch.arange(batch_size * seq_len, device=x.device)
-            batch_indices = torch.div(batch_seq_indices, seq_len, rounding_mode='floor')
+        # Deterministic processing of experts
+        # This approach ensures the same number of tensors are created during forward and recomputation
+        for k in range(self.top_k):
+            expert_idx = indices[..., k]
+            gate = gates[..., k:k+1]
             
-            # Initialize output tensor
-            routed_output = torch.zeros_like(x)
-            routed_output_flat = routed_output.view(-1, x.size(-1))
+            # Create a flattened version for processing
+            flat_x = x.reshape(-1, x.size(-1))
+            flat_expert_idx = expert_idx.reshape(-1)
+            flat_gate = gate.reshape(-1, 1)
             
-            # Process each expert separately to avoid memory explosion
-            for expert_id in range(self.num_routed_experts):
-                # Find tokens routed to this expert across all top-k slots
-                expert_locations = []
-                gate_values = []
-                
-                for k in range(self.top_k):
-                    # Get indices and gates for this k
-                    expert_indices = indices[..., k].reshape(-1)  # [batch*seq]
-                    k_gates = gates[..., k].reshape(-1)  # [batch*seq]
-                    
-                    # Find tokens assigned to this expert
-                    mask = (expert_indices == expert_id)
-                    token_indices = torch.nonzero(mask).squeeze(-1)  # Indices where this expert is used
-                    
-                    if token_indices.numel() > 0:
-                        expert_locations.append(token_indices)
-                        gate_values.append(k_gates[token_indices])
-                        
-                        # Update load balancing stats
-                        if update_biases and self.training:
-                            expert_counts[expert_id] += token_indices.size(0)
-                            if k == 0:  # Only count once per token for sequence stats
-                                for b in range(batch_size):
-                                    seq_mask = (batch_indices[token_indices] == b)
-                                    sequence_counts[b, expert_id] += seq_mask.sum().to(dtype=x.dtype)
-                
-                # Skip if no tokens are routed to this expert
-                if not expert_locations:
-                    continue
-                
-                # Combine all token indices and gates for this expert
-                all_indices = torch.cat(expert_locations, dim=0)
-                all_gates = torch.cat(gate_values, dim=0)
-                
-                # Get inputs for this expert (only the tokens that need it)
-                expert_inputs = x_flat[all_indices]
-                
-                # Process with this expert
-                expert_outputs = self.routed_experts[expert_id](expert_inputs)
-                
-                # Apply gates
-                gated_outputs = expert_outputs * all_gates.unsqueeze(-1)
-                
-                # Add to output tensor using scatter_add
-                for i in range(all_indices.size(0)):
-                    routed_output_flat[all_indices[i]] += gated_outputs[i]
-        else:
-            # Original implementation (memory intensive)
-            routed_output = torch.zeros_like(x)
-            
-            for k in range(self.top_k):
-                expert_idx = indices[..., k]
-                gate = gates[..., k:k+1]
-                
-                # Create a flattened version for processing
-                flat_x = x.reshape(-1, x.size(-1))
-                flat_expert_idx = expert_idx.reshape(-1)
-                flat_gate = gate.reshape(-1, 1)
-                
-                # Process each expert in a deterministic way
-                for i in range(self.num_routed_experts):
-                    # Create binary mask for this expert
-                    expert_mask = (flat_expert_idx == i)
-                    
-                    # Update load balancing stats
-                    if update_biases and self.training:
-                        expert_counts[i] += expert_mask.sum().to(dtype=x.dtype)
-                        
-                    # Apply the mask to get inputs for this expert
-                    mask_tensor = expert_mask.unsqueeze(-1).to(dtype=x.dtype)
-                    masked_input = flat_x * mask_tensor
-                    # Process all inputs (most will be zeros)
-                    expert_output = self.routed_experts[i](masked_input)
-                    # Apply gate values (also masked)
-                    gated_output = expert_output * (flat_gate * mask_tensor)
-                    # Add to the output
-                    routed_output += gated_output.reshape(x.shape)
+            # Process each expert in a deterministic way
+            for i in range(self.num_routed_experts):
+                # Create binary mask for this expert
+                expert_mask = (flat_expert_idx == i)
+                # Apply the mask to get inputs for this expert
+                # Convert mask to same dtype as x to avoid dtype mismatch
+                mask_tensor = expert_mask.unsqueeze(-1).to(dtype=x.dtype)
+                masked_input = flat_x * mask_tensor
+                # Process all inputs (most will be zeros)
+                expert_output = self.routed_experts[i](masked_input)
+                # Apply gate values (also masked)
+                gated_output = expert_output * (flat_gate * mask_tensor)
+                # Add to the output
+                routed_output += gated_output.reshape(x.shape)
         
         # Combine outputs
         output = shared_output + routed_output
         
         # Update biases based on expert load - only during training
         if update_biases and self.training:
+            # Calculate expert counts for batch-wise load balancing
+            expert_counts = torch.zeros(self.num_routed_experts, device=x.device, dtype=x.dtype)
+            
+            # Deterministic approach to count experts
+            flat_indices = indices.reshape(-1)
+            for i in range(self.num_routed_experts):
+                expert_counts[i] = (flat_indices == i).to(dtype=x.dtype).sum()
+                    
             target_count = (batch_size * seq_len * self.top_k) / self.num_routed_experts
             load_diff = expert_counts - target_count
             
             # Update biases
             with torch.no_grad():
                 self.expert_biases.data -= self.gamma * load_diff.to(self.expert_biases.dtype)
+            
+            # Compute sequence-wise auxiliary loss (L_Bal) - deterministic approach
+            sequence_counts = torch.zeros(batch_size, self.num_routed_experts, device=x.device, dtype=x.dtype)
+            
+            # Reshape indices to [batch, seq*top_k] for deterministic processing
+            reshaped_indices = indices.reshape(batch_size, -1)
+            for i in range(self.num_routed_experts):
+                sequence_counts[:, i] = (reshaped_indices == i).to(dtype=x.dtype).sum(dim=1)
             
             # Compute sequence-wise auxiliary loss (L_Bal)
             sequence_fractions = sequence_counts / (seq_len * self.top_k)
