@@ -14,7 +14,7 @@ def install_dependencies():
     
     # Core dependencies with specific versions to ensure compatibility
     dependencies = [
-        "numpy==1.24.3",  # Use NumPy 1.x for compatibility with SciPy
+        "numpy==1.23.4",  # Use NumPy 1.23.4 for best compatibility with DeepSpeed and other libraries
         "torch>=2.0.0",
         "transformers>=4.30.0",
         "datasets>=2.12.0",
